@@ -64,6 +64,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_http3_fake_inject_closing, 0, 0,
   ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, errorCode, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_http3_fake_inject_closed, 0, 0, IS_VOID, 0)
+  ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, errorCode, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_http3_fake_get_writes, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -82,7 +86,7 @@ static void php_http3_fake_adapter_push_signal(php_http3_fake_quic_adapter *adap
                                                php_http3_signal_type type,
                                                int64_t stream_id, uint64_t error_code,
                                                const char *data, size_t data_len,
-                                               zend_bool fin) {
+                                               zend_bool fin, zend_bool closed) {
   zval signal;
 
   array_init(&signal);
@@ -99,6 +103,9 @@ static void php_http3_fake_adapter_push_signal(php_http3_fake_quic_adapter *adap
   if (type == PHP_HTTP3_SIGNAL_STREAM_RESET ||
       type == PHP_HTTP3_SIGNAL_CONNECTION_CLOSING) {
     add_assoc_long(&signal, "errorCode", (zend_long)error_code);
+    if (closed) {
+      add_assoc_bool(&signal, "closed", 1);
+    }
   }
 
   add_next_index_zval(&adapter->signals, &signal);
@@ -193,7 +200,7 @@ PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectReadable) {
   ZEND_PARSE_PARAMETERS_END();
 
   php_http3_fake_adapter_push_signal(adapter, PHP_HTTP3_SIGNAL_STREAM_READABLE, stream_id, 0,
-                                     data, data_len, fin);
+                                     data, data_len, fin, 0);
 }
 
 PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectReset) {
@@ -208,7 +215,7 @@ PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectReset) {
   ZEND_PARSE_PARAMETERS_END();
 
   php_http3_fake_adapter_push_signal(adapter, PHP_HTTP3_SIGNAL_STREAM_RESET, stream_id,
-                                     (uint64_t)error_code, NULL, 0, 0);
+                                     (uint64_t)error_code, NULL, 0, 0, 0);
 }
 
 PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectConnectionClosing) {
@@ -221,7 +228,20 @@ PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectConnectionClosing) {
   ZEND_PARSE_PARAMETERS_END();
 
   php_http3_fake_adapter_push_signal(adapter, PHP_HTTP3_SIGNAL_CONNECTION_CLOSING, -1,
-                                     (uint64_t)error_code, NULL, 0, 0);
+                                     (uint64_t)error_code, NULL, 0, 0, 0);
+}
+
+PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, injectConnectionClosed) {
+  php_http3_fake_quic_adapter *adapter = Z_HTTP3_FAKE_ADAPTER_P(ZEND_THIS);
+  zend_long error_code = 0;
+
+  ZEND_PARSE_PARAMETERS_START(0, 1)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_LONG(error_code)
+  ZEND_PARSE_PARAMETERS_END();
+
+  php_http3_fake_adapter_push_signal(adapter, PHP_HTTP3_SIGNAL_CONNECTION_CLOSING, -1,
+                                     (uint64_t)error_code, NULL, 0, 0, 1);
 }
 
 PHP_METHOD(Nghttp3_Testing_FakeQuicAdapter, getWrites) {
@@ -275,6 +295,8 @@ static const zend_function_entry php_http3_fake_adapter_methods[] = {
          ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Testing_FakeQuicAdapter, injectConnectionClosing,
          arginfo_http3_fake_inject_closing, ZEND_ACC_PUBLIC)
+  PHP_ME(Nghttp3_Testing_FakeQuicAdapter, injectConnectionClosed,
+         arginfo_http3_fake_inject_closed, ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Testing_FakeQuicAdapter, getWrites, arginfo_http3_fake_get_writes,
          ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Testing_FakeQuicAdapter, getFinishedStreams,
