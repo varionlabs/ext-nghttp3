@@ -40,45 +40,44 @@
 
 ## 3. 実装対象のファイル分解
 
-`ext-nghttp3/` を新規作成し、以下を初期構成とする。
+リポジトリルートを nghttp3 拡張の配置先とし、以下を初期構成とする。
 
 ```text
-ext-nghttp3/
-  config.m4
-  php_nghttp3.h
-  nghttp3.c
-  README.md
-  src/
-    http3_connection.c
-    http3_request_stream.c
-    event.c
-    exception.c
-    bridge_fake.c
-    bridge_ngtcp2.c
-    native_client.c
-    native_callbacks.c
-    queue.c
-    headers.c
-    internal/
-      types.h
-      connection.h
-      stream.h
-      event.h
-      exception.h
-      bridge.h
-      native.h
-      queue.h
-      headers.h
-      macros.h
-  tests/
-    001_load_extension.phpt
-    010_http3_connection_ctor.phpt
-    020_create_request_stream.phpt
-    030_submit_headers_data_end.phpt
-    040_fake_signal_readable_to_events.phpt
-    050_terminal_rules.phpt
-    060_reset_and_goaway.phpt
-    100_integration_single_request.phpt
+config.m4
+php_nghttp3.h
+nghttp3.c
+README.md
+src/
+  http3_connection.c
+  http3_request_stream.c
+  event.c
+  exception.c
+  bridge_fake.c
+  bridge_ngtcp2.c
+  native_client.c
+  native_callbacks.c
+  queue.c
+  headers.c
+  internal/
+    types.h
+    connection.h
+    stream.h
+    event.h
+    exception.h
+    bridge.h
+    native.h
+    queue.h
+    headers.h
+    macros.h
+tests/
+  001_load_extension.phpt
+  010_http3_connection_ctor.phpt
+  020_create_request_stream.phpt
+  030_submit_headers_data_end.phpt
+  040_fake_signal_readable_to_events.phpt
+  050_terminal_rules.phpt
+  060_reset_and_goaway.phpt
+  100_integration_single_request.phpt
 ```
 
 ## 4. 最初のコミットで作る skeleton
@@ -343,4 +342,3 @@ Varion\Nghttp3\Events\RequestCompleted
 - PHPUnit (任意):
   - fake bridge を使ったシナリオを高速反復
   - event 変換ロジックのケース追加を容易化
-
