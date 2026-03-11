@@ -150,17 +150,17 @@ int php_nghttp3_event_init(INIT_FUNC_ARGS) {
   php_http3_event_ce->create_object = php_http3_event_create_object;
   php_http3_event_ce->ce_flags |= ZEND_ACC_EXPLICIT_ABSTRACT_CLASS;
 
-  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3", "ConnectionEvent", NULL);
+  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3\\Events", "ConnectionEvent", NULL);
   php_http3_connection_event_ce =
     zend_register_internal_class_ex(&ce, php_http3_event_ce);
   php_http3_connection_event_ce->ce_flags |= ZEND_ACC_EXPLICIT_ABSTRACT_CLASS;
 
-  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3", "StreamEvent", NULL);
+  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3\\Events", "StreamEvent", NULL);
   php_http3_stream_event_ce =
     zend_register_internal_class_ex(&ce, php_http3_event_ce);
   php_http3_stream_event_ce->ce_flags |= ZEND_ACC_EXPLICIT_ABSTRACT_CLASS;
 
-  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3", "TerminalStreamEvent", NULL);
+  INIT_NS_CLASS_ENTRY(ce, "Varion\\Nghttp3\\Events", "TerminalStreamEvent", NULL);
   php_http3_terminal_stream_event_ce =
     zend_register_internal_class_ex(&ce, php_http3_stream_event_ce);
   php_http3_terminal_stream_event_ce->ce_flags |= ZEND_ACC_EXPLICIT_ABSTRACT_CLASS;
