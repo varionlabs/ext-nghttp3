@@ -271,6 +271,9 @@ PHP_METHOD(Nghttp3_Testing_Http3ConnectionFactory, fromFake) {
   connection = Z_HTTP3_CONNECTION_P(return_value);
   ZVAL_COPY(&connection->fake_adapter, fake);
   connection->use_fake_adapter = 1;
+  connection->native_h3_enabled = 0;
+  connection->native_h3_streams_bound = 0;
+  connection->h3_conn = NULL;
   connection->closing = 0;
   connection->close_called = 0;
   connection->state = PHP_HTTP3_CONN_INITIAL;

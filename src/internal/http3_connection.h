@@ -14,5 +14,7 @@ int php_http3_connection_write_stream(php_http3_connection *connection, int64_t 
 int php_http3_connection_finish_stream(php_http3_connection *connection, int64_t stream_id);
 int php_http3_connection_reset_stream(php_http3_connection *connection, int64_t stream_id,
                                       uint64_t error_code);
+int php_http3_connection_submit_request_headers(php_http3_connection *connection,
+                                                int64_t stream_id, zval *headers);
 
 #endif /* PHP_NGHTTP3_CONNECTION_H */

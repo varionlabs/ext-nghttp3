@@ -121,12 +121,19 @@ PHP_METHOD(Nghttp3_Http3RequestStream, submitHeaders) {
   } ZEND_HASH_FOREACH_END();
 
   connection = Z_HTTP3_CONNECTION_P(&stream->connection);
-  payload = php_http3_encode_headers_payload(headers);
-  if (php_http3_connection_write_stream(connection, stream->stream_id, payload) != SUCCESS) {
+  if (!connection->use_fake_adapter && connection->native_h3_enabled) {
+    if (php_http3_connection_submit_request_headers(connection, stream->stream_id, headers) !=
+        SUCCESS) {
+      RETURN_THROWS();
+    }
+  } else {
+    payload = php_http3_encode_headers_payload(headers);
+    if (php_http3_connection_write_stream(connection, stream->stream_id, payload) != SUCCESS) {
+      zend_string_release(payload);
+      RETURN_THROWS();
+    }
     zend_string_release(payload);
-    RETURN_THROWS();
   }
-  zend_string_release(payload);
 
   stream->headers_submitted = 1;
 }

@@ -4,6 +4,8 @@
 #include "php.h"
 #include <stdint.h>
 
+typedef struct nghttp3_conn nghttp3_conn;
+
 typedef enum _php_http3_connection_state {
   PHP_HTTP3_CONN_INITIAL = 0,
   PHP_HTTP3_CONN_ACTIVE = 1,
@@ -51,9 +53,13 @@ typedef struct _php_http3_connection {
   HashTable request_streams;
   HashTable quic_streams;
   HashTable stream_states;
+  HashTable native_stream_bodies;
+  nghttp3_conn *h3_conn;
   php_http3_connection_state state;
   int64_t next_stream_id;
   zend_bool use_fake_adapter;
+  zend_bool native_h3_enabled;
+  zend_bool native_h3_streams_bound;
   zend_bool closing;
   zend_bool close_called;
   zend_object std;
