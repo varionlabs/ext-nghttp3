@@ -4,8 +4,10 @@
 
 #include <string.h>
 #include <Zend/zend_exceptions.h>
+#include <Zend/zend_smart_str.h>
 
 #include "internal/exception.h"
+#include "internal/http3_connection.h"
 #include "internal/http3_request_stream.h"
 #include "internal/macros.h"
 
@@ -36,6 +38,46 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_http3_request_stream_is_closed, 0, 0, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+static zend_string *php_http3_encode_headers_payload(zval *headers) {
+  smart_str payload = {0};
+  zval *pair;
+
+  ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(headers), pair) {
+    zval *name_zv;
+    zval *value_zv;
+    zend_string *name;
+    zend_string *value;
+
+    if (Z_TYPE_P(pair) != IS_ARRAY) {
+      continue;
+    }
+
+    name_zv = zend_hash_index_find(Z_ARRVAL_P(pair), 0);
+    value_zv = zend_hash_index_find(Z_ARRVAL_P(pair), 1);
+    if (name_zv == NULL || value_zv == NULL) {
+      continue;
+    }
+
+    name = zval_get_string(name_zv);
+    value = zval_get_string(value_zv);
+
+    smart_str_appendl(&payload, ZSTR_VAL(name), ZSTR_LEN(name));
+    smart_str_appendc(&payload, ':');
+    smart_str_appendl(&payload, ZSTR_VAL(value), ZSTR_LEN(value));
+    smart_str_appendc(&payload, '\n');
+
+    zend_string_release(name);
+    zend_string_release(value);
+  } ZEND_HASH_FOREACH_END();
+
+  smart_str_0(&payload);
+  if (payload.s == NULL) {
+    return zend_string_init("", 0, 0);
+  }
+
+  return payload.s;
+}
+
 PHP_METHOD(Nghttp3_Http3RequestStream, __construct) {
   zend_throw_exception(php_http3_invalid_operation_ce,
                        "Http3RequestStream cannot be constructed directly", 0);
@@ -48,9 +90,11 @@ PHP_METHOD(Nghttp3_Http3RequestStream, getId) {
 
 PHP_METHOD(Nghttp3_Http3RequestStream, submitHeaders) {
   php_http3_request_stream *stream = Z_HTTP3_REQUEST_STREAM_P(ZEND_THIS);
+  php_http3_connection *connection;
   zval *headers;
   HashTable *ht;
   zval *pair;
+  zend_string *payload;
 
   ZEND_PARSE_PARAMETERS_START(1, 1)
     Z_PARAM_ARRAY(headers)
@@ -76,13 +120,23 @@ PHP_METHOD(Nghttp3_Http3RequestStream, submitHeaders) {
     }
   } ZEND_HASH_FOREACH_END();
 
+  connection = Z_HTTP3_CONNECTION_P(&stream->connection);
+  payload = php_http3_encode_headers_payload(headers);
+  if (php_http3_connection_write_stream(connection, stream->stream_id, payload) != SUCCESS) {
+    zend_string_release(payload);
+    RETURN_THROWS();
+  }
+  zend_string_release(payload);
+
   stream->headers_submitted = 1;
 }
 
 PHP_METHOD(Nghttp3_Http3RequestStream, submitData) {
   php_http3_request_stream *stream = Z_HTTP3_REQUEST_STREAM_P(ZEND_THIS);
+  php_http3_connection *connection;
   char *data = NULL;
   size_t data_len = 0;
+  zend_string *payload;
 
   ZEND_PARSE_PARAMETERS_START(1, 1)
     Z_PARAM_STRING(data, data_len)
@@ -106,10 +160,19 @@ PHP_METHOD(Nghttp3_Http3RequestStream, submitData) {
                          "submitData() is not allowed after end()", 0);
     RETURN_THROWS();
   }
+
+  connection = Z_HTTP3_CONNECTION_P(&stream->connection);
+  payload = zend_string_init(data, data_len, 0);
+  if (php_http3_connection_write_stream(connection, stream->stream_id, payload) != SUCCESS) {
+    zend_string_release(payload);
+    RETURN_THROWS();
+  }
+  zend_string_release(payload);
 }
 
 PHP_METHOD(Nghttp3_Http3RequestStream, end) {
   php_http3_request_stream *stream = Z_HTTP3_REQUEST_STREAM_P(ZEND_THIS);
+  php_http3_connection *connection;
 
   if (stream->closed) {
     zend_throw_exception(php_http3_invalid_operation_ce,
@@ -127,12 +190,18 @@ PHP_METHOD(Nghttp3_Http3RequestStream, end) {
     RETURN_THROWS();
   }
 
+  connection = Z_HTTP3_CONNECTION_P(&stream->connection);
+  if (php_http3_connection_finish_stream(connection, stream->stream_id) != SUCCESS) {
+    RETURN_THROWS();
+  }
+
   stream->local_ended = 1;
   stream->closed = 1;
 }
 
 PHP_METHOD(Nghttp3_Http3RequestStream, reset) {
   php_http3_request_stream *stream = Z_HTTP3_REQUEST_STREAM_P(ZEND_THIS);
+  php_http3_connection *connection;
   zend_long error_code = 0;
 
   ZEND_PARSE_PARAMETERS_START(0, 1)
@@ -140,7 +209,12 @@ PHP_METHOD(Nghttp3_Http3RequestStream, reset) {
     Z_PARAM_LONG(error_code)
   ZEND_PARSE_PARAMETERS_END();
 
-  (void)error_code;
+  connection = Z_HTTP3_CONNECTION_P(&stream->connection);
+  if (php_http3_connection_reset_stream(connection, stream->stream_id,
+                                        (uint64_t)error_code) != SUCCESS) {
+    RETURN_THROWS();
+  }
+
   stream->closed = 1;
 }
 

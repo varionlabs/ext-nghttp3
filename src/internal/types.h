@@ -46,10 +46,12 @@ typedef struct _php_http3_request_stream_state {
 
 typedef struct _php_http3_connection {
   zval quic_connection;
+  zval fake_adapter;
   HashTable request_streams;
   HashTable stream_states;
   php_http3_connection_state state;
   int64_t next_stream_id;
+  zend_bool use_fake_adapter;
   zend_bool closing;
   zend_object std;
 } php_http3_connection;

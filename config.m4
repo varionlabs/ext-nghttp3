@@ -26,5 +26,6 @@ if test "$PHP_NGHTTP3" != "no"; then
     src/event.c
     src/http3_request_stream.c
     src/http3_connection.c
+    src/testing.c
   ], [$ext_shared])
 fi

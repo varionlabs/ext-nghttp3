@@ -10,6 +10,7 @@
 #include "src/internal/exception.h"
 #include "src/internal/http3_connection.h"
 #include "src/internal/http3_request_stream.h"
+#include "src/internal/testing.h"
 
 PHP_MINIT_FUNCTION(nghttp3);
 PHP_MSHUTDOWN_FUNCTION(nghttp3);
@@ -49,6 +50,10 @@ PHP_MINIT_FUNCTION(nghttp3) {
   }
 
   if (php_nghttp3_connection_init(INIT_FUNC_ARGS_PASSTHRU) != SUCCESS) {
+    return FAILURE;
+  }
+
+  if (php_nghttp3_testing_init(INIT_FUNC_ARGS_PASSTHRU) != SUCCESS) {
     return FAILURE;
   }
 
