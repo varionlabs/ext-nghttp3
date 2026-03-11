@@ -39,6 +39,7 @@ static const char *PHP_HTTP3_STATE_RESET_ERROR_CODE = "resetErrorCode";
 typedef struct _php_http3_native_stream_body {
   zend_string *data;
   size_t read_offset;
+  size_t acked_offset;
   zend_bool eof;
 } php_http3_native_stream_body;
 
@@ -66,6 +67,10 @@ static int php_http3_connection_find_quic_stream(php_http3_connection *connectio
                                                  int64_t stream_id, zval *stream_object,
                                                  zend_bool allow_missing,
                                                  zend_bool *stream_found);
+static int php_http3_connection_open_uni_stream_id(php_http3_connection *connection,
+                                                   int64_t *stream_id);
+static void php_http3_connection_cache_quic_stream(php_http3_connection *connection,
+                                                   int64_t stream_id, zval *stream_object);
 
 static void php_http3_native_stream_body_ptr_dtor(zval *zv) {
   php_http3_native_stream_body *body = (php_http3_native_stream_body *)Z_PTR_P(zv);
@@ -153,6 +158,46 @@ static int php_http3_connection_set_native_body_eof(php_http3_connection *connec
   return SUCCESS;
 }
 
+static void php_http3_connection_compact_native_body(php_http3_native_stream_body *body) {
+  size_t drop;
+  size_t len;
+
+  if (body == NULL || body->data == NULL || body->acked_offset == 0) {
+    return;
+  }
+
+  len = ZSTR_LEN(body->data);
+  drop = body->acked_offset > len ? len : body->acked_offset;
+  if (drop == 0) {
+    return;
+  }
+
+  if (drop < len) {
+    memmove(ZSTR_VAL(body->data), ZSTR_VAL(body->data) + drop, len - drop);
+  }
+  ZSTR_VAL(body->data)[len - drop] = '\0';
+  body->data = zend_string_truncate(body->data, len - drop, 0);
+  if (body->read_offset >= drop) {
+    body->read_offset -= drop;
+  } else {
+    body->read_offset = 0;
+  }
+  body->acked_offset = 0;
+}
+
+static void php_http3_connection_add_native_body_acked(php_http3_connection *connection,
+                                                       int64_t stream_id, uint64_t datalen) {
+  php_http3_native_stream_body *body;
+
+  body = php_http3_connection_get_or_create_native_body(connection, stream_id, 0);
+  if (body == NULL || datalen == 0) {
+    return;
+  }
+
+  body->acked_offset += (size_t)datalen;
+  php_http3_connection_compact_native_body(body);
+}
+
 static int php_http3_connection_emit_headers_once(php_http3_connection *connection,
                                                   int64_t stream_id) {
   zval *state;
@@ -211,6 +256,7 @@ static int php_http3_connection_emit_terminal_once(php_http3_connection *connect
     php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_REMOTE_ENDED, 1);
   }
   php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_TERMINAL, 1);
+  zend_hash_index_del(&connection->native_stream_bodies, (zend_ulong)stream_id);
   php_http3_connection_mark_stream_closed(connection, stream_id);
   return php_http3_connection_queue_event(connection, terminal_type, stream_id, error_code, NULL);
 }
@@ -292,6 +338,33 @@ static int php_http3_h3_recv_data_cb(nghttp3_conn *h3_conn, int64_t stream_id,
   return 0;
 }
 
+static int php_http3_h3_deferred_consume_cb(nghttp3_conn *h3_conn, int64_t stream_id,
+                                            size_t consumed, void *conn_user_data,
+                                            void *stream_user_data) {
+  (void)h3_conn;
+  (void)stream_id;
+  (void)consumed;
+  (void)conn_user_data;
+  (void)stream_user_data;
+  return 0;
+}
+
+static int php_http3_h3_acked_stream_data_cb(nghttp3_conn *h3_conn, int64_t stream_id,
+                                             uint64_t datalen, void *conn_user_data,
+                                             void *stream_user_data) {
+  php_http3_connection *connection = (php_http3_connection *)conn_user_data;
+
+  (void)h3_conn;
+  (void)stream_user_data;
+
+  if (connection == NULL) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+
+  php_http3_connection_add_native_body_acked(connection, stream_id, datalen);
+  return 0;
+}
+
 static int php_http3_h3_recv_header_cb(nghttp3_conn *h3_conn, int64_t stream_id, int32_t token,
                                        nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
                                        void *conn_user_data, void *stream_user_data) {
@@ -360,8 +433,10 @@ static int php_http3_connection_init_native_h3(php_http3_connection *connection)
   int rv;
 
   memset(&callbacks, 0, sizeof(callbacks));
+  callbacks.acked_stream_data = php_http3_h3_acked_stream_data_cb;
   callbacks.stream_close = php_http3_h3_stream_close_cb;
   callbacks.recv_data = php_http3_h3_recv_data_cb;
+  callbacks.deferred_consume = php_http3_h3_deferred_consume_cb;
   callbacks.recv_header = php_http3_h3_recv_header_cb;
   callbacks.end_stream = php_http3_h3_end_stream_cb;
   callbacks.stop_sending = php_http3_h3_stop_sending_cb;
@@ -380,6 +455,9 @@ static int php_http3_connection_init_native_h3(php_http3_connection *connection)
 }
 
 static int php_http3_connection_bind_native_h3_streams(php_http3_connection *connection) {
+  int64_t control_stream_id = PHP_HTTP3_LOCAL_CONTROL_STREAM_ID;
+  int64_t qpack_encoder_stream_id = PHP_HTTP3_LOCAL_QPACK_ENCODER_STREAM_ID;
+  int64_t qpack_decoder_stream_id = PHP_HTTP3_LOCAL_QPACK_DECODER_STREAM_ID;
   int rv;
 
   if (!connection->native_h3_enabled || connection->h3_conn == NULL) {
@@ -389,15 +467,33 @@ static int php_http3_connection_bind_native_h3_streams(php_http3_connection *con
     return SUCCESS;
   }
 
-  rv = nghttp3_conn_bind_control_stream(connection->h3_conn, PHP_HTTP3_LOCAL_CONTROL_STREAM_ID);
+  if (php_http3_connection_open_uni_stream_id(connection, &control_stream_id) != SUCCESS) {
+    if (EG(exception)) {
+      return FAILURE;
+    }
+    control_stream_id = PHP_HTTP3_LOCAL_CONTROL_STREAM_ID;
+  }
+  if (php_http3_connection_open_uni_stream_id(connection, &qpack_encoder_stream_id) != SUCCESS) {
+    if (EG(exception)) {
+      return FAILURE;
+    }
+    qpack_encoder_stream_id = PHP_HTTP3_LOCAL_QPACK_ENCODER_STREAM_ID;
+  }
+  if (php_http3_connection_open_uni_stream_id(connection, &qpack_decoder_stream_id) != SUCCESS) {
+    if (EG(exception)) {
+      return FAILURE;
+    }
+    qpack_decoder_stream_id = PHP_HTTP3_LOCAL_QPACK_DECODER_STREAM_ID;
+  }
+
+  rv = nghttp3_conn_bind_control_stream(connection->h3_conn, control_stream_id);
   if (rv != 0) {
     php_http3_connection_throw_nghttp3_error("nghttp3_conn_bind_control_stream failed", rv);
     return FAILURE;
   }
 
-  rv = nghttp3_conn_bind_qpack_streams(connection->h3_conn,
-                                       PHP_HTTP3_LOCAL_QPACK_ENCODER_STREAM_ID,
-                                       PHP_HTTP3_LOCAL_QPACK_DECODER_STREAM_ID);
+  rv = nghttp3_conn_bind_qpack_streams(connection->h3_conn, qpack_encoder_stream_id,
+                                       qpack_decoder_stream_id);
   if (rv != 0) {
     php_http3_connection_throw_nghttp3_error("nghttp3_conn_bind_qpack_streams failed", rv);
     return FAILURE;
@@ -713,6 +809,63 @@ static int php_http3_connection_call_fake_method(php_http3_connection *connectio
   return php_http3_call_method_on_object(&connection->fake_adapter, method_name, param_count,
                                          params, retval,
                                          "Failed to call fake adapter method");
+}
+
+static int php_http3_connection_open_uni_stream_id(php_http3_connection *connection,
+                                                   int64_t *stream_id) {
+  zval retval;
+  zval id_retval;
+
+  if (Z_ISUNDEF(connection->quic_connection)) {
+    zend_throw_exception(php_http3_state_exception_ce, "QUIC connection is not available", 0);
+    return FAILURE;
+  }
+
+  if (!zend_hash_str_exists(&Z_OBJCE(connection->quic_connection)->function_table,
+                            ZEND_STRL("openunistream"))) {
+    return FAILURE;
+  }
+
+  ZVAL_UNDEF(&retval);
+  if (php_http3_call_method_on_object(&connection->quic_connection, "openUniStream", 0, NULL,
+                                      &retval, "Failed to call QUIC openUniStream()") !=
+      SUCCESS) {
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+    return FAILURE;
+  }
+
+  if (Z_TYPE(retval) != IS_OBJECT) {
+    zval_ptr_dtor(&retval);
+    zend_throw_exception(php_http3_native_exception_ce,
+                         "QUIC openUniStream() must return stream object", 0);
+    return FAILURE;
+  }
+
+  ZVAL_UNDEF(&id_retval);
+  if (php_http3_call_method_on_object(&retval, "getId", 0, NULL, &id_retval,
+                                      "Failed to read QUIC uni stream id") != SUCCESS) {
+    zval_ptr_dtor(&retval);
+    if (!Z_ISUNDEF(id_retval)) {
+      zval_ptr_dtor(&id_retval);
+    }
+    return FAILURE;
+  }
+
+  if (Z_TYPE(id_retval) != IS_LONG) {
+    zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&id_retval);
+    zend_throw_exception(php_http3_native_exception_ce,
+                         "QUIC uni stream getId() must return int", 0);
+    return FAILURE;
+  }
+
+  *stream_id = (int64_t)Z_LVAL(id_retval);
+  php_http3_connection_cache_quic_stream(connection, *stream_id, &retval);
+  zval_ptr_dtor(&retval);
+  zval_ptr_dtor(&id_retval);
+  return SUCCESS;
 }
 
 static int php_http3_connection_write_quic_stream_optional(php_http3_connection *connection,
