@@ -47,6 +47,7 @@ typedef struct _php_http3_request_stream_state {
 typedef struct _php_http3_connection {
   zval quic_connection;
   zval fake_adapter;
+  zval event_queue;
   HashTable request_streams;
   HashTable stream_states;
   php_http3_connection_state state;

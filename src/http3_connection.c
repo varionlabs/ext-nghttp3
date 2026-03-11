@@ -5,6 +5,7 @@
 #include <string.h>
 #include <Zend/zend_exceptions.h>
 
+#include "internal/event.h"
 #include "internal/exception.h"
 #include "internal/http3_connection.h"
 #include "internal/http3_request_stream.h"
@@ -12,6 +13,278 @@
 
 zend_class_entry *php_http3_connection_ce;
 static zend_object_handlers php_http3_connection_handlers;
+
+static const char *PHP_HTTP3_STATE_REQUEST_HEADERS_SUBMITTED = "requestHeadersSubmitted";
+static const char *PHP_HTTP3_STATE_LOCAL_ENDED = "localEnded";
+static const char *PHP_HTTP3_STATE_REMOTE_HEADERS_RECEIVED = "remoteHeadersReceived";
+static const char *PHP_HTTP3_STATE_REMOTE_ENDED = "remoteEnded";
+static const char *PHP_HTTP3_STATE_TERMINAL = "terminal";
+static const char *PHP_HTTP3_STATE_RESET = "reset";
+static const char *PHP_HTTP3_STATE_RESET_ERROR_CODE = "resetErrorCode";
+
+static int php_http3_connection_call_fake_method(php_http3_connection *connection,
+                                                 const char *method_name,
+                                                 uint32_t param_count, zval *params,
+                                                 zval *retval);
+
+static void php_http3_connection_init_stream_state(zval *state) {
+  array_init(state);
+  add_assoc_bool(state, PHP_HTTP3_STATE_REQUEST_HEADERS_SUBMITTED, 0);
+  add_assoc_bool(state, PHP_HTTP3_STATE_LOCAL_ENDED, 0);
+  add_assoc_bool(state, PHP_HTTP3_STATE_REMOTE_HEADERS_RECEIVED, 0);
+  add_assoc_bool(state, PHP_HTTP3_STATE_REMOTE_ENDED, 0);
+  add_assoc_bool(state, PHP_HTTP3_STATE_TERMINAL, 0);
+  add_assoc_bool(state, PHP_HTTP3_STATE_RESET, 0);
+  add_assoc_null(state, PHP_HTTP3_STATE_RESET_ERROR_CODE);
+}
+
+static zval *php_http3_connection_get_or_create_stream_state(php_http3_connection *connection,
+                                                             int64_t stream_id) {
+  zval *state = zend_hash_index_find(&connection->stream_states, stream_id);
+
+  if (state != NULL) {
+    return state;
+  }
+
+  {
+    zval new_state;
+    php_http3_connection_init_stream_state(&new_state);
+    zend_hash_index_update(&connection->stream_states, stream_id, &new_state);
+  }
+
+  return zend_hash_index_find(&connection->stream_states, stream_id);
+}
+
+static zend_bool php_http3_stream_state_get_bool(zval *state, const char *key) {
+  zval *value;
+
+  if (state == NULL || Z_TYPE_P(state) != IS_ARRAY) {
+    return 0;
+  }
+
+  value = zend_hash_str_find(Z_ARRVAL_P(state), key, strlen(key));
+  if (value == NULL) {
+    return 0;
+  }
+
+  return zend_is_true(value);
+}
+
+static void php_http3_stream_state_set_bool(zval *state, const char *key, zend_bool value) {
+  if (state == NULL || Z_TYPE_P(state) != IS_ARRAY) {
+    return;
+  }
+
+  add_assoc_bool(state, key, value);
+}
+
+static void php_http3_stream_state_set_error_code(zval *state, uint64_t error_code) {
+  if (state == NULL || Z_TYPE_P(state) != IS_ARRAY) {
+    return;
+  }
+
+  add_assoc_long(state, PHP_HTTP3_STATE_RESET_ERROR_CODE, (zend_long)error_code);
+}
+
+static void php_http3_connection_mark_stream_closed(php_http3_connection *connection,
+                                                    int64_t stream_id) {
+  zval *stream_zv = zend_hash_index_find(&connection->request_streams, stream_id);
+
+  if (stream_zv == NULL || Z_TYPE_P(stream_zv) != IS_OBJECT) {
+    return;
+  }
+
+  Z_HTTP3_REQUEST_STREAM_P(stream_zv)->closed = 1;
+}
+
+static int php_http3_connection_queue_event(php_http3_connection *connection,
+                                            php_http3_event_type type, int64_t stream_id,
+                                            uint64_t error_code, zend_string *payload) {
+  zval event_zv;
+  php_http3_event_object *event_obj;
+
+  object_init_ex(&event_zv, php_http3_event_class_for_type(type));
+  event_obj = Z_HTTP3_EVENT_OBJ_P(&event_zv);
+  event_obj->type = type;
+  event_obj->stream_id = stream_id;
+  event_obj->error_code = error_code;
+
+  if (event_obj->payload != NULL) {
+    zend_string_release(event_obj->payload);
+  }
+  if (payload != NULL) {
+    event_obj->payload = zend_string_copy(payload);
+  } else {
+    event_obj->payload = zend_string_init("", 0, 0);
+  }
+
+  add_next_index_zval(&connection->event_queue, &event_zv);
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_readable_signal(php_http3_connection *connection,
+                                                        zval *signal) {
+  zval *stream_id_zv;
+  zval *data_zv;
+  zval *fin_zv;
+  zval *state;
+  int64_t stream_id;
+  zend_bool fin;
+
+  stream_id_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "streamId", sizeof("streamId") - 1);
+  if (stream_id_zv == NULL) {
+    return SUCCESS;
+  }
+
+  stream_id = (int64_t)zval_get_long(stream_id_zv);
+  state = php_http3_connection_get_or_create_stream_state(connection, stream_id);
+  if (php_http3_stream_state_get_bool(state, PHP_HTTP3_STATE_TERMINAL)) {
+    return SUCCESS;
+  }
+
+  if (!php_http3_stream_state_get_bool(state, PHP_HTTP3_STATE_REMOTE_HEADERS_RECEIVED)) {
+    php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_HEADERS_RECEIVED, stream_id, 0,
+                                     NULL);
+    php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_REMOTE_HEADERS_RECEIVED, 1);
+  }
+
+  data_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "data", sizeof("data") - 1);
+  if (data_zv != NULL && Z_TYPE_P(data_zv) == IS_STRING && Z_STRLEN_P(data_zv) > 0) {
+    php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_DATA_RECEIVED, stream_id, 0,
+                                     Z_STR_P(data_zv));
+  }
+
+  fin_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "fin", sizeof("fin") - 1);
+  fin = fin_zv != NULL ? zend_is_true(fin_zv) : 0;
+  if (fin && !php_http3_stream_state_get_bool(state, PHP_HTTP3_STATE_TERMINAL)) {
+    php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_REQUEST_COMPLETED, stream_id, 0,
+                                     NULL);
+    php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_REMOTE_ENDED, 1);
+    php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_TERMINAL, 1);
+    php_http3_connection_mark_stream_closed(connection, stream_id);
+  }
+
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_reset_signal(php_http3_connection *connection,
+                                                     zval *signal) {
+  zval *stream_id_zv;
+  zval *error_code_zv;
+  zval *state;
+  int64_t stream_id;
+  uint64_t error_code = 0;
+
+  stream_id_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "streamId", sizeof("streamId") - 1);
+  if (stream_id_zv == NULL) {
+    return SUCCESS;
+  }
+
+  error_code_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "errorCode", sizeof("errorCode") - 1);
+  if (error_code_zv != NULL) {
+    error_code = (uint64_t)zval_get_long(error_code_zv);
+  }
+
+  stream_id = (int64_t)zval_get_long(stream_id_zv);
+  state = php_http3_connection_get_or_create_stream_state(connection, stream_id);
+  if (php_http3_stream_state_get_bool(state, PHP_HTTP3_STATE_TERMINAL)) {
+    return SUCCESS;
+  }
+
+  php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_STREAM_RESET, stream_id, error_code,
+                                   NULL);
+  php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_RESET, 1);
+  php_http3_stream_state_set_bool(state, PHP_HTTP3_STATE_TERMINAL, 1);
+  php_http3_stream_state_set_error_code(state, error_code);
+  php_http3_connection_mark_stream_closed(connection, stream_id);
+
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_closing_signal(php_http3_connection *connection,
+                                                       zval *signal) {
+  zval *error_code_zv;
+  uint64_t error_code = 0;
+
+  if (connection->state == PHP_HTTP3_CONN_GOAWAY_RECEIVED ||
+      connection->state == PHP_HTTP3_CONN_CLOSING ||
+      connection->state == PHP_HTTP3_CONN_CLOSED) {
+    return SUCCESS;
+  }
+
+  error_code_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "errorCode", sizeof("errorCode") - 1);
+  if (error_code_zv != NULL) {
+    error_code = (uint64_t)zval_get_long(error_code_zv);
+  }
+
+  connection->closing = 1;
+  connection->state = PHP_HTTP3_CONN_GOAWAY_RECEIVED;
+  php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_GOAWAY_RECEIVED, -1, error_code,
+                                   NULL);
+
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_signal(php_http3_connection *connection, zval *signal) {
+  zval *type_zv;
+  zend_long type;
+
+  if (Z_TYPE_P(signal) != IS_ARRAY) {
+    return SUCCESS;
+  }
+
+  type_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "type", sizeof("type") - 1);
+  if (type_zv == NULL) {
+    return SUCCESS;
+  }
+
+  type = zval_get_long(type_zv);
+  switch ((php_http3_signal_type)type) {
+  case PHP_HTTP3_SIGNAL_STREAM_READABLE:
+    return php_http3_connection_consume_readable_signal(connection, signal);
+  case PHP_HTTP3_SIGNAL_STREAM_RESET:
+    return php_http3_connection_consume_reset_signal(connection, signal);
+  case PHP_HTTP3_SIGNAL_CONNECTION_CLOSING:
+    return php_http3_connection_consume_closing_signal(connection, signal);
+  default:
+    return SUCCESS;
+  }
+}
+
+static int php_http3_connection_pump_fake_signals(php_http3_connection *connection) {
+  zval retval;
+  zval *signal;
+
+  if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
+    return SUCCESS;
+  }
+
+  ZVAL_UNDEF(&retval);
+  if (php_http3_connection_call_fake_method(connection, "pollSignals", 0, NULL, &retval) !=
+      SUCCESS) {
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+    return FAILURE;
+  }
+
+  if (Z_TYPE(retval) != IS_ARRAY) {
+    zval_ptr_dtor(&retval);
+    zend_throw_exception(php_http3_native_exception_ce,
+                         "Fake adapter pollSignals() must return array", 0);
+    return FAILURE;
+  }
+
+  ZEND_HASH_FOREACH_VAL(Z_ARRVAL(retval), signal) {
+    if (php_http3_connection_consume_signal(connection, signal) != SUCCESS) {
+      zval_ptr_dtor(&retval);
+      return FAILURE;
+    }
+  } ZEND_HASH_FOREACH_END();
+
+  zval_ptr_dtor(&retval);
+  return SUCCESS;
+}
 
 static int php_http3_connection_call_fake_method(php_http3_connection *connection,
                                                  const char *method_name,
@@ -192,6 +465,10 @@ PHP_METHOD(Nghttp3_Http3Connection, __construct) {
     zval_ptr_dtor(&connection->fake_adapter);
     ZVAL_UNDEF(&connection->fake_adapter);
   }
+  if (!Z_ISUNDEF(connection->event_queue)) {
+    zval_ptr_dtor(&connection->event_queue);
+  }
+  array_init(&connection->event_queue);
 
   ZVAL_COPY(&connection->quic_connection, quic);
   connection->use_fake_adapter = 0;
@@ -232,19 +509,20 @@ PHP_METHOD(Nghttp3_Http3Connection, createRequestStream) {
   ZVAL_COPY(&stream_ref, return_value);
   zend_hash_index_update(&connection->request_streams, stream_id, &stream_ref);
 
-  array_init(&state);
-  add_assoc_bool(&state, "requestHeadersSubmitted", 0);
-  add_assoc_bool(&state, "localEnded", 0);
-  add_assoc_bool(&state, "remoteHeadersReceived", 0);
-  add_assoc_bool(&state, "remoteEnded", 0);
-  add_assoc_bool(&state, "terminal", 0);
-  add_assoc_bool(&state, "reset", 0);
-  add_assoc_null(&state, "resetErrorCode");
+  php_http3_connection_init_stream_state(&state);
   zend_hash_index_update(&connection->stream_states, stream_id, &state);
 }
 
 PHP_METHOD(Nghttp3_Http3Connection, pollEvents) {
-  array_init(return_value);
+  php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
+
+  if (php_http3_connection_pump_fake_signals(connection) != SUCCESS) {
+    RETURN_THROWS();
+  }
+
+  RETVAL_COPY(&connection->event_queue);
+  zval_ptr_dtor(&connection->event_queue);
+  array_init(&connection->event_queue);
 }
 
 PHP_METHOD(Nghttp3_Http3Connection, isClosing) {
@@ -277,6 +555,7 @@ static zend_object *php_http3_connection_create_object(zend_class_entry *ce) {
   connection = zend_object_alloc(sizeof(*connection), ce);
   ZVAL_UNDEF(&connection->quic_connection);
   ZVAL_UNDEF(&connection->fake_adapter);
+  array_init(&connection->event_queue);
   zend_hash_init(&connection->request_streams, 8, NULL, ZVAL_PTR_DTOR, 0);
   zend_hash_init(&connection->stream_states, 8, NULL, ZVAL_PTR_DTOR, 0);
   connection->state = PHP_HTTP3_CONN_INITIAL;
@@ -303,6 +582,10 @@ static void php_http3_connection_free_object(zend_object *object) {
   if (!Z_ISUNDEF(connection->fake_adapter)) {
     zval_ptr_dtor(&connection->fake_adapter);
     ZVAL_UNDEF(&connection->fake_adapter);
+  }
+  if (!Z_ISUNDEF(connection->event_queue)) {
+    zval_ptr_dtor(&connection->event_queue);
+    ZVAL_UNDEF(&connection->event_queue);
   }
 
   zend_hash_destroy(&connection->request_streams);
