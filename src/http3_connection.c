@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include <Zend/zend_exceptions.h>
+#include <Zend/zend_smart_str.h>
 
 #include "internal/event.h"
 #include "internal/exception.h"
@@ -21,6 +22,17 @@ static const char *PHP_HTTP3_STATE_REMOTE_ENDED = "remoteEnded";
 static const char *PHP_HTTP3_STATE_TERMINAL = "terminal";
 static const char *PHP_HTTP3_STATE_RESET = "reset";
 static const char *PHP_HTTP3_STATE_RESET_ERROR_CODE = "resetErrorCode";
+
+/* Varion\Ngtcp2\Event constants */
+#define PHP_NGTCP2_EVENT_CONNECTION_CLOSED 2
+#define PHP_NGTCP2_EVENT_CONNECTION_DRAINING 3
+#define PHP_NGTCP2_EVENT_STREAM_READABLE 11
+#define PHP_NGTCP2_EVENT_STREAM_CLOSED 13
+#define PHP_NGTCP2_EVENT_STREAM_RESET 14
+
+static int php_http3_call_method_on_object(zval *object, const char *method_name,
+                                           uint32_t param_count, zval *params, zval *retval,
+                                           const char *context_message);
 
 static int php_http3_connection_call_fake_method(php_http3_connection *connection,
                                                  const char *method_name,
@@ -251,6 +263,29 @@ static int php_http3_connection_consume_signal(php_http3_connection *connection,
   }
 }
 
+static int php_http3_call_method_on_object(zval *object, const char *method_name,
+                                           uint32_t param_count, zval *params, zval *retval,
+                                           const char *context_message) {
+  zval function_name;
+
+  ZVAL_STRING(&function_name, method_name);
+  if (call_user_function(NULL, object, &function_name, retval, param_count, params) ==
+      FAILURE) {
+    zval_ptr_dtor(&function_name);
+    if (!EG(exception)) {
+      zend_throw_exception(php_http3_native_exception_ce, context_message, 0);
+    }
+    return FAILURE;
+  }
+  zval_ptr_dtor(&function_name);
+
+  if (EG(exception)) {
+    return FAILURE;
+  }
+
+  return SUCCESS;
+}
+
 static int php_http3_connection_pump_fake_signals(php_http3_connection *connection) {
   zval retval;
   zval *signal;
@@ -290,36 +325,342 @@ static int php_http3_connection_call_fake_method(php_http3_connection *connectio
                                                  const char *method_name,
                                                  uint32_t param_count, zval *params,
                                                  zval *retval) {
-  zval function_name;
-
   if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
     return FAILURE;
   }
 
-  ZVAL_STRING(&function_name, method_name);
-  if (call_user_function(NULL, &connection->fake_adapter, &function_name, retval,
-                         param_count, params) == FAILURE) {
-    zval_ptr_dtor(&function_name);
+  return php_http3_call_method_on_object(&connection->fake_adapter, method_name, param_count,
+                                         params, retval,
+                                         "Failed to call fake adapter method");
+}
+
+static void php_http3_connection_cache_quic_stream(php_http3_connection *connection,
+                                                   int64_t stream_id, zval *stream_object) {
+  zval copy;
+
+  ZVAL_COPY(&copy, stream_object);
+  zend_hash_index_update(&connection->quic_streams, stream_id, &copy);
+}
+
+static int php_http3_connection_get_quic_stream(php_http3_connection *connection,
+                                                int64_t stream_id, zval *stream_object) {
+  zval *cached;
+  zval params[1];
+  zval retval;
+
+  cached = zend_hash_index_find(&connection->quic_streams, stream_id);
+  if (cached != NULL && Z_TYPE_P(cached) == IS_OBJECT) {
+    ZVAL_COPY(stream_object, cached);
+    return SUCCESS;
+  }
+
+  if (Z_ISUNDEF(connection->quic_connection)) {
+    zend_throw_exception(php_http3_state_exception_ce, "QUIC connection is not available", 0);
+    return FAILURE;
+  }
+
+  ZVAL_LONG(&params[0], stream_id);
+  ZVAL_UNDEF(&retval);
+  if (php_http3_call_method_on_object(&connection->quic_connection, "getStream", 1, params,
+                                      &retval, "Failed to call QUIC getStream()") != SUCCESS) {
+    zval_ptr_dtor(&params[0]);
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+    return FAILURE;
+  }
+  zval_ptr_dtor(&params[0]);
+
+  if (Z_TYPE(retval) != IS_OBJECT) {
+    zval_ptr_dtor(&retval);
+    zend_throw_exception(php_http3_state_exception_ce, "QUIC stream was not found", 0);
+    return FAILURE;
+  }
+
+  php_http3_connection_cache_quic_stream(connection, stream_id, &retval);
+  ZVAL_COPY(stream_object, &retval);
+  zval_ptr_dtor(&retval);
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_ngtcp2_stream_readable(php_http3_connection *connection,
+                                                               int64_t stream_id) {
+  zval stream_object;
+  zval read_params[1];
+  zval read_retval;
+  zval is_closed_retval;
+  zval signal;
+  smart_str payload = {0};
+  zend_bool fin = 0;
+  int i;
+
+  ZVAL_UNDEF(&stream_object);
+  if (php_http3_connection_get_quic_stream(connection, stream_id, &stream_object) != SUCCESS) {
+    if (!EG(exception)) {
+      return SUCCESS;
+    }
+    return FAILURE;
+  }
+
+  ZVAL_LONG(&read_params[0], 65535);
+  for (i = 0; i < 1024; ++i) {
+    ZVAL_UNDEF(&read_retval);
+    if (php_http3_call_method_on_object(&stream_object, "read", 1, read_params, &read_retval,
+                                        "Failed to read QUIC stream") != SUCCESS) {
+      zval_ptr_dtor(&read_params[0]);
+      zval_ptr_dtor(&stream_object);
+      if (!Z_ISUNDEF(read_retval)) {
+        zval_ptr_dtor(&read_retval);
+      }
+      smart_str_free(&payload);
+      return FAILURE;
+    }
+
+    if (Z_TYPE(read_retval) != IS_STRING || Z_STRLEN(read_retval) == 0) {
+      zval_ptr_dtor(&read_retval);
+      break;
+    }
+
+    smart_str_appendl(&payload, Z_STRVAL(read_retval), Z_STRLEN(read_retval));
+    zval_ptr_dtor(&read_retval);
+  }
+  zval_ptr_dtor(&read_params[0]);
+  smart_str_0(&payload);
+
+  ZVAL_UNDEF(&is_closed_retval);
+  if (php_http3_call_method_on_object(&stream_object, "isClosed", 0, NULL, &is_closed_retval,
+                                      "Failed to inspect QUIC stream state") != SUCCESS) {
+    zval_ptr_dtor(&stream_object);
+    smart_str_free(&payload);
+    if (!Z_ISUNDEF(is_closed_retval)) {
+      zval_ptr_dtor(&is_closed_retval);
+    }
+    return FAILURE;
+  }
+  fin = zend_is_true(&is_closed_retval);
+
+  array_init(&signal);
+  add_assoc_long(&signal, "type", PHP_HTTP3_SIGNAL_STREAM_READABLE);
+  add_assoc_long(&signal, "streamId", (zend_long)stream_id);
+  if (payload.s != NULL) {
+    add_assoc_str(&signal, "data", zend_string_copy(payload.s));
+  } else {
+    add_assoc_string(&signal, "data", "");
+  }
+  add_assoc_bool(&signal, "fin", fin);
+
+  if (php_http3_connection_consume_signal(connection, &signal) != SUCCESS) {
+    zval_ptr_dtor(&signal);
+    zval_ptr_dtor(&stream_object);
+    zval_ptr_dtor(&read_retval);
+    zval_ptr_dtor(&is_closed_retval);
+    return FAILURE;
+  }
+
+  zval_ptr_dtor(&signal);
+  zval_ptr_dtor(&stream_object);
+  zval_ptr_dtor(&is_closed_retval);
+  smart_str_free(&payload);
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_ngtcp2_stream_closed(php_http3_connection *connection,
+                                                             int64_t stream_id) {
+  zval signal;
+
+  array_init(&signal);
+  add_assoc_long(&signal, "type", PHP_HTTP3_SIGNAL_STREAM_READABLE);
+  add_assoc_long(&signal, "streamId", (zend_long)stream_id);
+  add_assoc_string(&signal, "data", "");
+  add_assoc_bool(&signal, "fin", 1);
+
+  if (php_http3_connection_consume_signal(connection, &signal) != SUCCESS) {
+    zval_ptr_dtor(&signal);
+    return FAILURE;
+  }
+
+  zval_ptr_dtor(&signal);
+  return SUCCESS;
+}
+
+static int php_http3_connection_consume_ngtcp2_event(php_http3_connection *connection,
+                                                     zval *event_object) {
+  zval retval;
+  zval signal;
+  zend_long type;
+  zend_long stream_id = -1;
+  zend_long error_code = 0;
+
+  ZVAL_UNDEF(&retval);
+  if (php_http3_call_method_on_object(event_object, "getType", 0, NULL, &retval,
+                                      "Failed to read QUIC event type") != SUCCESS) {
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+    return FAILURE;
+  }
+
+  type = zval_get_long(&retval);
+  zval_ptr_dtor(&retval);
+
+  if (type == PHP_NGTCP2_EVENT_STREAM_READABLE || type == PHP_NGTCP2_EVENT_STREAM_CLOSED ||
+      type == PHP_NGTCP2_EVENT_STREAM_RESET) {
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(event_object, "getStreamId", 0, NULL, &retval,
+                                        "Failed to read QUIC event stream id") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+    stream_id = zval_get_long(&retval);
+    zval_ptr_dtor(&retval);
+  }
+
+  switch (type) {
+  case PHP_NGTCP2_EVENT_STREAM_READABLE:
+    return php_http3_connection_consume_ngtcp2_stream_readable(connection, stream_id);
+  case PHP_NGTCP2_EVENT_STREAM_CLOSED:
+    return php_http3_connection_consume_ngtcp2_stream_closed(connection, stream_id);
+  case PHP_NGTCP2_EVENT_STREAM_RESET:
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(event_object, "getErrorCode", 0, NULL, &retval,
+                                        "Failed to read QUIC event error code") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+    error_code = zval_get_long(&retval);
+    zval_ptr_dtor(&retval);
+
+    array_init(&signal);
+    add_assoc_long(&signal, "type", PHP_HTTP3_SIGNAL_STREAM_RESET);
+    add_assoc_long(&signal, "streamId", stream_id);
+    add_assoc_long(&signal, "errorCode", error_code);
+    if (php_http3_connection_consume_signal(connection, &signal) != SUCCESS) {
+      zval_ptr_dtor(&signal);
+      return FAILURE;
+    }
+    zval_ptr_dtor(&signal);
+    return SUCCESS;
+  case PHP_NGTCP2_EVENT_CONNECTION_CLOSED:
+  case PHP_NGTCP2_EVENT_CONNECTION_DRAINING:
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(event_object, "getErrorCode", 0, NULL, &retval,
+                                        "Failed to read QUIC connection error code") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+    error_code = zval_get_long(&retval);
+    zval_ptr_dtor(&retval);
+
+    array_init(&signal);
+    add_assoc_long(&signal, "type", PHP_HTTP3_SIGNAL_CONNECTION_CLOSING);
+    add_assoc_long(&signal, "errorCode", error_code);
+    if (php_http3_connection_consume_signal(connection, &signal) != SUCCESS) {
+      zval_ptr_dtor(&signal);
+      return FAILURE;
+    }
+    zval_ptr_dtor(&signal);
+    return SUCCESS;
+  default:
+    return SUCCESS;
+  }
+}
+
+static int php_http3_connection_pump_ngtcp2_signals(php_http3_connection *connection) {
+  zval retval;
+  zval *event_object;
+
+  if (connection->use_fake_adapter || Z_ISUNDEF(connection->quic_connection)) {
+    return SUCCESS;
+  }
+
+  ZVAL_UNDEF(&retval);
+  if (php_http3_call_method_on_object(&connection->quic_connection, "pollEvents", 0, NULL,
+                                      &retval, "Failed to call QUIC pollEvents()") != SUCCESS) {
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+    return FAILURE;
+  }
+
+  if (Z_TYPE(retval) != IS_ARRAY) {
+    zval_ptr_dtor(&retval);
     zend_throw_exception(php_http3_native_exception_ce,
-                         "Failed to call fake adapter method", 0);
-    return FAILURE;
-  }
-  zval_ptr_dtor(&function_name);
-
-  if (EG(exception)) {
+                         "QUIC pollEvents() must return array", 0);
     return FAILURE;
   }
 
+  ZEND_HASH_FOREACH_VAL(Z_ARRVAL(retval), event_object) {
+    if (Z_TYPE_P(event_object) != IS_OBJECT) {
+      continue;
+    }
+    if (php_http3_connection_consume_ngtcp2_event(connection, event_object) != SUCCESS) {
+      zval_ptr_dtor(&retval);
+      return FAILURE;
+    }
+  } ZEND_HASH_FOREACH_END();
+
+  zval_ptr_dtor(&retval);
   return SUCCESS;
 }
 
 int php_http3_connection_open_request_stream_id(php_http3_connection *connection,
                                                 int64_t *stream_id) {
   zval retval;
+  zval stream_id_retval;
 
-  if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
-    *stream_id = connection->next_stream_id;
-    connection->next_stream_id += 4;
+  if (!connection->use_fake_adapter) {
+    if (Z_ISUNDEF(connection->quic_connection)) {
+      zend_throw_exception(php_http3_state_exception_ce, "QUIC connection is not available", 0);
+      return FAILURE;
+    }
+
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(&connection->quic_connection, "openStream", 0, NULL,
+                                        &retval, "Failed to call QUIC openStream()") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+
+    if (Z_TYPE(retval) != IS_OBJECT) {
+      zval_ptr_dtor(&retval);
+      zend_throw_exception(php_http3_native_exception_ce,
+                           "QUIC openStream() must return stream object", 0);
+      return FAILURE;
+    }
+
+    ZVAL_UNDEF(&stream_id_retval);
+    if (php_http3_call_method_on_object(&retval, "getId", 0, NULL, &stream_id_retval,
+                                        "Failed to read QUIC stream id") != SUCCESS) {
+      zval_ptr_dtor(&retval);
+      if (!Z_ISUNDEF(stream_id_retval)) {
+        zval_ptr_dtor(&stream_id_retval);
+      }
+      return FAILURE;
+    }
+
+    if (Z_TYPE(stream_id_retval) != IS_LONG) {
+      zval_ptr_dtor(&retval);
+      zval_ptr_dtor(&stream_id_retval);
+      zend_throw_exception(php_http3_native_exception_ce,
+                           "QUIC stream getId() must return int", 0);
+      return FAILURE;
+    }
+
+    *stream_id = (int64_t)Z_LVAL(stream_id_retval);
+    php_http3_connection_cache_quic_stream(connection, *stream_id, &retval);
+    zval_ptr_dtor(&retval);
+    zval_ptr_dtor(&stream_id_retval);
+    if (*stream_id >= connection->next_stream_id) {
+      connection->next_stream_id = *stream_id + 4;
+    }
     return SUCCESS;
   }
 
@@ -348,8 +689,31 @@ int php_http3_connection_write_stream(php_http3_connection *connection, int64_t 
                                       zend_string *data) {
   zval params[2];
   zval retval;
+  zval stream_object;
 
-  if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
+  if (!connection->use_fake_adapter) {
+    ZVAL_UNDEF(&stream_object);
+    if (php_http3_connection_get_quic_stream(connection, stream_id, &stream_object) != SUCCESS) {
+      return FAILURE;
+    }
+
+    ZVAL_STR_COPY(&params[0], data);
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(&stream_object, "write", 1, params, &retval,
+                                        "Failed to call QUIC stream write()") != SUCCESS) {
+      zval_ptr_dtor(&params[0]);
+      zval_ptr_dtor(&stream_object);
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+
+    zval_ptr_dtor(&params[0]);
+    zval_ptr_dtor(&stream_object);
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
     return SUCCESS;
   }
 
@@ -378,8 +742,28 @@ int php_http3_connection_write_stream(php_http3_connection *connection, int64_t 
 int php_http3_connection_finish_stream(php_http3_connection *connection, int64_t stream_id) {
   zval params[1];
   zval retval;
+  zval stream_object;
 
-  if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
+  if (!connection->use_fake_adapter) {
+    ZVAL_UNDEF(&stream_object);
+    if (php_http3_connection_get_quic_stream(connection, stream_id, &stream_object) != SUCCESS) {
+      return FAILURE;
+    }
+
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(&stream_object, "end", 0, NULL, &retval,
+                                        "Failed to call QUIC stream end()") != SUCCESS) {
+      zval_ptr_dtor(&stream_object);
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+
+    zval_ptr_dtor(&stream_object);
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
     return SUCCESS;
   }
 
@@ -406,8 +790,31 @@ int php_http3_connection_reset_stream(php_http3_connection *connection, int64_t 
                                       uint64_t error_code) {
   zval params[2];
   zval retval;
+  zval stream_object;
 
-  if (!connection->use_fake_adapter || Z_ISUNDEF(connection->fake_adapter)) {
+  if (!connection->use_fake_adapter) {
+    ZVAL_UNDEF(&stream_object);
+    if (php_http3_connection_get_quic_stream(connection, stream_id, &stream_object) != SUCCESS) {
+      return FAILURE;
+    }
+
+    ZVAL_LONG(&params[0], (zend_long)error_code);
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(&stream_object, "reset", 1, params, &retval,
+                                        "Failed to call QUIC stream reset()") != SUCCESS) {
+      zval_ptr_dtor(&params[0]);
+      zval_ptr_dtor(&stream_object);
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+
+    zval_ptr_dtor(&params[0]);
+    zval_ptr_dtor(&stream_object);
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
     return SUCCESS;
   }
 
@@ -469,9 +876,14 @@ PHP_METHOD(Nghttp3_Http3Connection, __construct) {
     zval_ptr_dtor(&connection->event_queue);
   }
   array_init(&connection->event_queue);
+  zend_hash_clean(&connection->request_streams);
+  zend_hash_clean(&connection->quic_streams);
+  zend_hash_clean(&connection->stream_states);
 
   ZVAL_COPY(&connection->quic_connection, quic);
   connection->use_fake_adapter = 0;
+  connection->next_stream_id = 0;
+  connection->closing = 0;
   connection->state = PHP_HTTP3_CONN_INITIAL;
 }
 
@@ -516,8 +928,14 @@ PHP_METHOD(Nghttp3_Http3Connection, createRequestStream) {
 PHP_METHOD(Nghttp3_Http3Connection, pollEvents) {
   php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
 
-  if (php_http3_connection_pump_fake_signals(connection) != SUCCESS) {
-    RETURN_THROWS();
+  if (connection->use_fake_adapter) {
+    if (php_http3_connection_pump_fake_signals(connection) != SUCCESS) {
+      RETURN_THROWS();
+    }
+  } else {
+    if (php_http3_connection_pump_ngtcp2_signals(connection) != SUCCESS) {
+      RETURN_THROWS();
+    }
   }
 
   RETVAL_COPY(&connection->event_queue);
@@ -532,6 +950,22 @@ PHP_METHOD(Nghttp3_Http3Connection, isClosing) {
 
 PHP_METHOD(Nghttp3_Http3Connection, close) {
   php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
+  zval retval;
+
+  if (!connection->use_fake_adapter && !Z_ISUNDEF(connection->quic_connection)) {
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(&connection->quic_connection, "close", 0, NULL, &retval,
+                                        "Failed to call QUIC close()") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      RETURN_THROWS();
+    }
+    if (!Z_ISUNDEF(retval)) {
+      zval_ptr_dtor(&retval);
+    }
+  }
+
   connection->closing = 1;
   connection->state = PHP_HTTP3_CONN_CLOSING;
 }
@@ -557,6 +991,7 @@ static zend_object *php_http3_connection_create_object(zend_class_entry *ce) {
   ZVAL_UNDEF(&connection->fake_adapter);
   array_init(&connection->event_queue);
   zend_hash_init(&connection->request_streams, 8, NULL, ZVAL_PTR_DTOR, 0);
+  zend_hash_init(&connection->quic_streams, 8, NULL, ZVAL_PTR_DTOR, 0);
   zend_hash_init(&connection->stream_states, 8, NULL, ZVAL_PTR_DTOR, 0);
   connection->state = PHP_HTTP3_CONN_INITIAL;
   connection->next_stream_id = 0;
@@ -589,6 +1024,7 @@ static void php_http3_connection_free_object(zend_object *object) {
   }
 
   zend_hash_destroy(&connection->request_streams);
+  zend_hash_destroy(&connection->quic_streams);
   zend_hash_destroy(&connection->stream_states);
   zend_object_std_dtor(&connection->std);
 }
