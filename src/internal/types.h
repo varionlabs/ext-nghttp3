@@ -55,6 +55,7 @@ typedef struct _php_http3_connection {
   int64_t next_stream_id;
   zend_bool use_fake_adapter;
   zend_bool closing;
+  zend_bool close_called;
   zend_object std;
 } php_http3_connection;
 

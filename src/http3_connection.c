@@ -215,12 +215,25 @@ static int php_http3_connection_consume_reset_signal(php_http3_connection *conne
 
 static int php_http3_connection_consume_closing_signal(php_http3_connection *connection,
                                                        zval *signal) {
+  zval *closed_zv;
   zval *error_code_zv;
+  zend_bool closed = 0;
   uint64_t error_code = 0;
 
+  closed_zv = zend_hash_str_find(Z_ARRVAL_P(signal), "closed", sizeof("closed") - 1);
+  if (closed_zv != NULL) {
+    closed = zend_is_true(closed_zv);
+  }
+
+  if (connection->state == PHP_HTTP3_CONN_CLOSED) {
+    return SUCCESS;
+  }
   if (connection->state == PHP_HTTP3_CONN_GOAWAY_RECEIVED ||
-      connection->state == PHP_HTTP3_CONN_CLOSING ||
-      connection->state == PHP_HTTP3_CONN_CLOSED) {
+      connection->state == PHP_HTTP3_CONN_CLOSING) {
+    connection->closing = 1;
+    if (closed) {
+      connection->state = PHP_HTTP3_CONN_CLOSED;
+    }
     return SUCCESS;
   }
 
@@ -230,7 +243,7 @@ static int php_http3_connection_consume_closing_signal(php_http3_connection *con
   }
 
   connection->closing = 1;
-  connection->state = PHP_HTTP3_CONN_GOAWAY_RECEIVED;
+  connection->state = closed ? PHP_HTTP3_CONN_CLOSED : PHP_HTTP3_CONN_GOAWAY_RECEIVED;
   php_http3_connection_queue_event(connection, PHP_HTTP3_EVENT_GOAWAY_RECEIVED, -1, error_code,
                                    NULL);
 
@@ -545,6 +558,27 @@ static int php_http3_connection_consume_ngtcp2_event(php_http3_connection *conne
     zval_ptr_dtor(&signal);
     return SUCCESS;
   case PHP_NGTCP2_EVENT_CONNECTION_CLOSED:
+    ZVAL_UNDEF(&retval);
+    if (php_http3_call_method_on_object(event_object, "getErrorCode", 0, NULL, &retval,
+                                        "Failed to read QUIC connection error code") != SUCCESS) {
+      if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+      }
+      return FAILURE;
+    }
+    error_code = zval_get_long(&retval);
+    zval_ptr_dtor(&retval);
+
+    array_init(&signal);
+    add_assoc_long(&signal, "type", PHP_HTTP3_SIGNAL_CONNECTION_CLOSING);
+    add_assoc_long(&signal, "errorCode", error_code);
+    add_assoc_bool(&signal, "closed", 1);
+    if (php_http3_connection_consume_signal(connection, &signal) != SUCCESS) {
+      zval_ptr_dtor(&signal);
+      return FAILURE;
+    }
+    zval_ptr_dtor(&signal);
+    return SUCCESS;
   case PHP_NGTCP2_EVENT_CONNECTION_DRAINING:
     ZVAL_UNDEF(&retval);
     if (php_http3_call_method_on_object(event_object, "getErrorCode", 0, NULL, &retval,
@@ -884,6 +918,7 @@ PHP_METHOD(Nghttp3_Http3Connection, __construct) {
   connection->use_fake_adapter = 0;
   connection->next_stream_id = 0;
   connection->closing = 0;
+  connection->close_called = 0;
   connection->state = PHP_HTTP3_CONN_INITIAL;
 }
 
@@ -952,6 +987,10 @@ PHP_METHOD(Nghttp3_Http3Connection, close) {
   php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
   zval retval;
 
+  if (connection->close_called) {
+    return;
+  }
+
   if (!connection->use_fake_adapter && !Z_ISUNDEF(connection->quic_connection)) {
     ZVAL_UNDEF(&retval);
     if (php_http3_call_method_on_object(&connection->quic_connection, "close", 0, NULL, &retval,
@@ -966,8 +1005,11 @@ PHP_METHOD(Nghttp3_Http3Connection, close) {
     }
   }
 
+  connection->close_called = 1;
   connection->closing = 1;
-  connection->state = PHP_HTTP3_CONN_CLOSING;
+  if (connection->state != PHP_HTTP3_CONN_CLOSED) {
+    connection->state = PHP_HTTP3_CONN_CLOSING;
+  }
 }
 
 static const zend_function_entry php_http3_connection_methods[] = {
@@ -997,6 +1039,7 @@ static zend_object *php_http3_connection_create_object(zend_class_entry *ce) {
   connection->next_stream_id = 0;
   connection->use_fake_adapter = 0;
   connection->closing = 0;
+  connection->close_called = 0;
 
   zend_object_std_init(&connection->std, ce);
   object_properties_init(&connection->std, ce);
