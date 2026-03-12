@@ -88,6 +88,7 @@ if ($udp === false) {
     throw new RuntimeException("UDP socket error: {$errno} {$errstr}");
 }
 stream_set_blocking($udp, false);
+fwrite(STDERR, "client target {$host}:{$port}\n");
 
 $stream = $http3->createRequestStream();
 $stream->submitHeaders([
@@ -108,6 +109,7 @@ $receivedHeaders = false;
 $completed = false;
 $streamResetError = null;
 $goawayError = null;
+$loggedPeer = false;
 
 while (microtime(true) < $deadline && !$quic->isClosed() && !$http3->isClosing()) {
     foreach ($quic->drainOutgoingDatagrams() as $outgoing) {
@@ -129,6 +131,10 @@ while (microtime(true) < $deadline && !$quic->isClosed() && !$http3->isClosing()
     if ($ready > 0) {
         $packet = stream_socket_recvfrom($udp, 65535, 0, $peer);
         if (is_string($packet) && $packet !== '') {
+            if (!$loggedPeer && is_string($peer) && $peer !== '') {
+                fwrite(STDERR, "client recv from {$peer}\n");
+                $loggedPeer = true;
+            }
             $quic->recv(new Datagram($packet, $remote));
         }
     } else {
