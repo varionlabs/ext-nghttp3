@@ -24,6 +24,9 @@ static const char *PHP_HTTP3_STATE_REMOTE_ENDED = "remoteEnded";
 static const char *PHP_HTTP3_STATE_TERMINAL = "terminal";
 static const char *PHP_HTTP3_STATE_RESET = "reset";
 static const char *PHP_HTTP3_STATE_RESET_ERROR_CODE = "resetErrorCode";
+static const char *PHP_HTTP3_NGTCP2_CONNECTION_CLASS = "Varion\\Ngtcp2\\Connection";
+static const char *PHP_HTTP3_NGTCP2_SERVER_CONNECTION_CLASS =
+  "Varion\\Ngtcp2\\ServerConnection";
 
 /* Varion\Ngtcp2\Event constants */
 #define PHP_NGTCP2_EVENT_CONNECTION_CLOSED 2
@@ -427,7 +430,8 @@ static int php_http3_h3_reset_stream_cb(nghttp3_conn *h3_conn, int64_t stream_id
                                       stream_user_data);
 }
 
-static int php_http3_connection_init_native_h3(php_http3_connection *connection) {
+static int php_http3_connection_init_native_h3(php_http3_connection *connection,
+                                                zend_bool server_mode) {
   nghttp3_callbacks callbacks;
   nghttp3_settings settings;
   int rv;
@@ -443,13 +447,19 @@ static int php_http3_connection_init_native_h3(php_http3_connection *connection)
   callbacks.reset_stream = php_http3_h3_reset_stream_cb;
 
   nghttp3_settings_default(&settings);
-  rv = nghttp3_conn_client_new(&connection->h3_conn, &callbacks, &settings, NULL, connection);
+  if (server_mode) {
+    rv = nghttp3_conn_server_new(&connection->h3_conn, &callbacks, &settings, NULL, connection);
+  } else {
+    rv = nghttp3_conn_client_new(&connection->h3_conn, &callbacks, &settings, NULL, connection);
+  }
   if (rv != 0) {
-    php_http3_connection_throw_nghttp3_error("nghttp3_conn_client_new failed", rv);
+    php_http3_connection_throw_nghttp3_error(
+      server_mode ? "nghttp3_conn_server_new failed" : "nghttp3_conn_client_new failed", rv);
     return FAILURE;
   }
 
   connection->native_h3_enabled = 1;
+  connection->native_h3_server = server_mode;
   connection->native_h3_streams_bound = 0;
   return SUCCESS;
 }
@@ -1527,11 +1537,20 @@ int php_http3_connection_submit_request_headers(php_http3_connection *connection
   }
 
   (void)php_http3_connection_get_or_create_native_body(connection, stream_id, 1);
-  rv = nghttp3_conn_submit_request(connection->h3_conn, stream_id, nva, idx, &dr, NULL);
-  if (rv != 0) {
-    php_http3_connection_throw_nghttp3_error("nghttp3_conn_submit_request failed", rv);
-    rv = FAILURE;
-    goto cleanup;
+  if (connection->native_h3_server) {
+    rv = nghttp3_conn_submit_response(connection->h3_conn, stream_id, nva, idx, &dr);
+    if (rv != 0) {
+      php_http3_connection_throw_nghttp3_error("nghttp3_conn_submit_response failed", rv);
+      rv = FAILURE;
+      goto cleanup;
+    }
+  } else {
+    rv = nghttp3_conn_submit_request(connection->h3_conn, stream_id, nva, idx, &dr, NULL);
+    if (rv != 0) {
+      php_http3_connection_throw_nghttp3_error("nghttp3_conn_submit_request failed", rv);
+      rv = FAILURE;
+      goto cleanup;
+    }
   }
 
   rv = php_http3_connection_flush_h3_writes(connection);
@@ -1746,12 +1765,23 @@ int php_http3_connection_reset_stream(php_http3_connection *connection, int64_t 
   return SUCCESS;
 }
 
-static zend_bool php_http3_is_native_ngtcp2_connection(zval *quic) {
+static zend_bool php_http3_is_native_ngtcp2_client_connection(zval *quic) {
   if (quic == NULL || Z_TYPE_P(quic) != IS_OBJECT) {
     return 0;
   }
 
-  return zend_string_equals_literal(Z_OBJCE_P(quic)->name, "Varion\\Ngtcp2\\Connection");
+  return zend_string_equals_cstr(Z_OBJCE_P(quic)->name, PHP_HTTP3_NGTCP2_CONNECTION_CLASS,
+                                 strlen(PHP_HTTP3_NGTCP2_CONNECTION_CLASS));
+}
+
+static zend_bool php_http3_is_native_ngtcp2_server_connection(zval *quic) {
+  if (quic == NULL || Z_TYPE_P(quic) != IS_OBJECT) {
+    return 0;
+  }
+
+  return zend_string_equals_cstr(Z_OBJCE_P(quic)->name,
+                                 PHP_HTTP3_NGTCP2_SERVER_CONNECTION_CLASS,
+                                 strlen(PHP_HTTP3_NGTCP2_SERVER_CONNECTION_CLASS));
 }
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_http3_connection_construct, 0, 0, 1)
@@ -1760,6 +1790,11 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_http3_connection_create_request_stream, 0, 0,
                                        Varion\\Nghttp3\\Http3RequestStream, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_http3_connection_get_request_stream, 0, 1,
+                                       Varion\\Nghttp3\\Http3RequestStream, 1)
+  ZEND_ARG_TYPE_INFO(0, streamId, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_http3_connection_poll_events, 0, 0, IS_ARRAY, 0)
@@ -1774,6 +1809,8 @@ ZEND_END_ARG_INFO()
 PHP_METHOD(Nghttp3_Http3Connection, __construct) {
   php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
   zval *quic = NULL;
+  zend_bool is_native_client = 0;
+  zend_bool is_native_server = 0;
 
   ZEND_PARSE_PARAMETERS_START(1, 1)
     Z_PARAM_OBJECT(quic)
@@ -1802,14 +1839,18 @@ PHP_METHOD(Nghttp3_Http3Connection, __construct) {
   ZVAL_COPY(&connection->quic_connection, quic);
   connection->use_fake_adapter = 0;
   connection->native_h3_enabled = 0;
+  connection->native_h3_server = 0;
   connection->native_h3_streams_bound = 0;
   connection->next_stream_id = 0;
   connection->closing = 0;
   connection->close_called = 0;
   connection->state = PHP_HTTP3_CONN_INITIAL;
 
-  if (php_http3_is_native_ngtcp2_connection(quic)) {
-    if (php_http3_connection_init_native_h3(connection) != SUCCESS) {
+  is_native_client = php_http3_is_native_ngtcp2_client_connection(quic);
+  is_native_server = php_http3_is_native_ngtcp2_server_connection(quic);
+
+  if (is_native_client || is_native_server) {
+    if (php_http3_connection_init_native_h3(connection, is_native_server) != SUCCESS) {
       RETURN_THROWS();
     }
   }
@@ -1820,6 +1861,12 @@ PHP_METHOD(Nghttp3_Http3Connection, createRequestStream) {
   int64_t stream_id;
   zval stream_ref;
   zval state;
+
+  if (connection->native_h3_server) {
+    zend_throw_exception(php_http3_state_exception_ce,
+                         "createRequestStream() is not available for server connection", 0);
+    RETURN_THROWS();
+  }
 
   if (connection->state == PHP_HTTP3_CONN_GOAWAY_RECEIVED) {
     zend_throw_exception(php_http3_state_exception_ce,
@@ -1851,6 +1898,68 @@ PHP_METHOD(Nghttp3_Http3Connection, createRequestStream) {
 
   php_http3_connection_init_stream_state(&state);
   zend_hash_index_update(&connection->stream_states, stream_id, &state);
+}
+
+PHP_METHOD(Nghttp3_Http3Connection, getRequestStream) {
+  php_http3_connection *connection = Z_HTTP3_CONNECTION_P(ZEND_THIS);
+  zend_long stream_id = -1;
+  zval *existing;
+  zval stream_ref;
+  zval state;
+  zval stream_object;
+  zend_bool stream_found = 0;
+  zval *state_zv;
+  php_http3_request_stream *stream;
+
+  ZEND_PARSE_PARAMETERS_START(1, 1)
+    Z_PARAM_LONG(stream_id)
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (stream_id < 0) {
+    zend_argument_value_error(1, "must be greater than or equal to 0");
+    RETURN_THROWS();
+  }
+
+  existing = zend_hash_index_find(&connection->request_streams, (zend_ulong)stream_id);
+  if (existing != NULL && Z_TYPE_P(existing) == IS_OBJECT) {
+    RETURN_COPY(existing);
+  }
+
+  state_zv = zend_hash_index_find(&connection->stream_states, (zend_ulong)stream_id);
+  if (state_zv == NULL) {
+    ZVAL_UNDEF(&stream_object);
+    if (php_http3_connection_find_quic_stream(connection, (int64_t)stream_id, &stream_object, 1,
+                                              &stream_found) != SUCCESS) {
+      RETURN_THROWS();
+    }
+
+    if (stream_found) {
+      zval_ptr_dtor(&stream_object);
+    } else {
+      RETURN_NULL();
+    }
+
+    php_http3_connection_init_stream_state(&state);
+    zend_hash_index_update(&connection->stream_states, (zend_ulong)stream_id, &state);
+    state_zv = zend_hash_index_find(&connection->stream_states, (zend_ulong)stream_id);
+  }
+
+  php_http3_request_stream_create(return_value, ZEND_THIS, (int64_t)stream_id);
+  stream = Z_HTTP3_REQUEST_STREAM_P(return_value);
+
+  if (state_zv != NULL && php_http3_stream_state_get_bool(state_zv, PHP_HTTP3_STATE_TERMINAL)) {
+    stream->closed = 1;
+  }
+  if (state_zv != NULL &&
+      php_http3_stream_state_get_bool(state_zv, PHP_HTTP3_STATE_REQUEST_HEADERS_SUBMITTED)) {
+    stream->headers_submitted = 1;
+  }
+  if (state_zv != NULL && php_http3_stream_state_get_bool(state_zv, PHP_HTTP3_STATE_LOCAL_ENDED)) {
+    stream->local_ended = 1;
+  }
+
+  ZVAL_COPY(&stream_ref, return_value);
+  zend_hash_index_update(&connection->request_streams, (zend_ulong)stream_id, &stream_ref);
 }
 
 PHP_METHOD(Nghttp3_Http3Connection, pollEvents) {
@@ -1910,6 +2019,8 @@ static const zend_function_entry php_http3_connection_methods[] = {
          ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Http3Connection, createRequestStream,
          arginfo_http3_connection_create_request_stream, ZEND_ACC_PUBLIC)
+  PHP_ME(Nghttp3_Http3Connection, getRequestStream,
+         arginfo_http3_connection_get_request_stream, ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Http3Connection, pollEvents, arginfo_http3_connection_poll_events,
          ZEND_ACC_PUBLIC)
   PHP_ME(Nghttp3_Http3Connection, isClosing, arginfo_http3_connection_is_closing,
@@ -1935,6 +2046,7 @@ static zend_object *php_http3_connection_create_object(zend_class_entry *ce) {
   connection->next_stream_id = 0;
   connection->use_fake_adapter = 0;
   connection->native_h3_enabled = 0;
+  connection->native_h3_server = 0;
   connection->native_h3_streams_bound = 0;
   connection->closing = 0;
   connection->close_called = 0;

@@ -15,6 +15,10 @@ echo $ctorParam->getType()->getName(), "\n";
 $create = new ReflectionMethod('Varion\\Nghttp3\\Http3Connection', 'createRequestStream');
 echo $create->getReturnType()->getName(), "\n";
 
+$getRequestStream = new ReflectionMethod('Varion\\Nghttp3\\Http3Connection', 'getRequestStream');
+echo $getRequestStream->getReturnType()->getName(), "\n";
+echo $getRequestStream->getReturnType()->allowsNull() ? "1\n" : "0\n";
+
 $poll = new ReflectionMethod('Varion\\Nghttp3\\Http3Connection', 'pollEvents');
 echo $poll->getReturnType()->getName(), "\n";
 
@@ -48,6 +52,8 @@ echo $isClosed->getReturnType()->getName(), "\n";
 --EXPECT--
 Varion\Ngtcp2\QuicConnection
 Varion\Nghttp3\Http3RequestStream
+Varion\Nghttp3\Http3RequestStream
+1
 array
 bool
 void

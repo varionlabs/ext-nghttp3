@@ -39,7 +39,31 @@ Optional flags:
 - `--authority=example.com`
 - `--timeout-ms=8000`
 
+## Experimental HTTP/3 server example
+
+`http3_server_echo.php` accepts one native `ServerConnection` and responds with:
+
+- `:status: 200`
+- `content-type: text/plain`
+- body: `<prefix><request-body>`
+
+```sh
+php -n \
+  -d extension=$(pwd)/modules/nghttp3.so \
+  -d extension=$(pwd)/ext-ngtcp2/modules/ngtcp2.so \
+  examples/http3_server_echo.php \
+  --host=127.0.0.1 --port=4433 --prefix='echo: '
+```
+
+Optional flags:
+
+- `--cert=/tmp/nghttp3/server.crt`
+- `--key=/tmp/nghttp3/server.key`
+- `--alpn=h3`
+- `--timeout-ms=30000`
+
 ## Notes
 
 - `ext-ngtcp2/examples/server_minimal.php` is a QUIC transport example and is not an HTTP/3 application server.
 - For response parsing with `Http3Connection`, use an HTTP/3-capable peer.
+- Server-side `Http3Connection` path is experimental and currently validated by integration tests where UDP bind is available.
