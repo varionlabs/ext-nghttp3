@@ -1363,14 +1363,33 @@ static int php_http3_connection_consume_ngtcp2_event(php_http3_connection *conne
 static int php_http3_connection_pump_ngtcp2_signals(php_http3_connection *connection) {
   zval retval;
   zval *event_object;
+  const char *event_method_name;
+  const char *call_error_message;
+  const char *return_type_message;
 
   if (connection->use_fake_adapter || Z_ISUNDEF(connection->quic_connection)) {
     return SUCCESS;
   }
 
+  if (zend_hash_str_exists(&Z_OBJCE(connection->quic_connection)->function_table,
+                           ZEND_STRL("drainevents"))) {
+    event_method_name = "drainEvents";
+    call_error_message = "Failed to call QUIC drainEvents()";
+    return_type_message = "QUIC drainEvents() must return array";
+  } else if (zend_hash_str_exists(&Z_OBJCE(connection->quic_connection)->function_table,
+                                  ZEND_STRL("pollevents"))) {
+    event_method_name = "pollEvents";
+    call_error_message = "Failed to call QUIC pollEvents()";
+    return_type_message = "QUIC pollEvents() must return array";
+  } else {
+    zend_throw_exception(php_http3_native_exception_ce,
+                         "QUIC connection must provide drainEvents() or pollEvents()", 0);
+    return FAILURE;
+  }
+
   ZVAL_UNDEF(&retval);
-  if (php_http3_call_method_on_object(&connection->quic_connection, "pollEvents", 0, NULL,
-                                      &retval, "Failed to call QUIC pollEvents()") != SUCCESS) {
+  if (php_http3_call_method_on_object(&connection->quic_connection, event_method_name, 0, NULL,
+                                      &retval, call_error_message) != SUCCESS) {
     if (!Z_ISUNDEF(retval)) {
       zval_ptr_dtor(&retval);
     }
@@ -1379,8 +1398,7 @@ static int php_http3_connection_pump_ngtcp2_signals(php_http3_connection *connec
 
   if (Z_TYPE(retval) != IS_ARRAY) {
     zval_ptr_dtor(&retval);
-    zend_throw_exception(php_http3_native_exception_ce,
-                         "QUIC pollEvents() must return array", 0);
+    zend_throw_exception(php_http3_native_exception_ce, return_type_message, 0);
     return FAILURE;
   }
 

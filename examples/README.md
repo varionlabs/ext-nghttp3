@@ -8,7 +8,7 @@
 2. Use a `Varion\Ngtcp2\Connection` as QUIC transport and wrap it with `Varion\Nghttp3\Http3Connection`.
 3. Drive network I/O in userland (Sans-I/O):
    - `recv(Datagram)` on incoming UDP packets
-   - `flush()` for outgoing QUIC datagrams
+   - `drainOutgoingDatagrams()` for outgoing QUIC datagrams
    - `getNextTimeout()/onTimeout()` for timer progression
 4. Build request headers as `[[name, value], ...]` pairs:
    - Include pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`)

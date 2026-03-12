@@ -28,7 +28,7 @@ $stream->submitHeaders([
 $stream->submitData('abc');
 $stream->end();
 
-$datagrams = $quic->flush();
+$datagrams = $quic->drainOutgoingDatagrams();
 $events = $http3->pollEvents();
 
 var_dump($stream->getId() === 0);

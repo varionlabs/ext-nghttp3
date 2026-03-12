@@ -116,12 +116,12 @@ try {
 
     $deadline = microtime(true) + 8.0;
     while (microtime(true) < $deadline && !$clientConn->isClosed()) {
-        foreach ($clientConn->flush() as $dgram) {
+        foreach ($clientConn->drainOutgoingDatagrams() as $dgram) {
             stream_socket_sendto($clientSock, $dgram->getPayload());
         }
 
         if ($serverConn instanceof ServerConnection && is_string($serverPeer) && $serverPeer !== '') {
-            foreach ($serverConn->flush() as $dgram) {
+            foreach ($serverConn->drainOutgoingDatagrams() as $dgram) {
                 stream_socket_sendto($serverSock, $dgram->getPayload(), 0, $serverPeer);
             }
         }

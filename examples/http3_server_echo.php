@@ -188,11 +188,11 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
 
     if ($serverConn instanceof ServerConnection && is_string($peer) && $peer !== '') {
         try {
-            foreach ($serverConn->flush() as $outgoing) {
+            foreach ($serverConn->drainOutgoingDatagrams() as $outgoing) {
                 stream_socket_sendto($udp, $outgoing->getPayload(), 0, $peer);
             }
         } catch (Throwable $e) {
-            fwrite(STDERR, "flush warning: {$e->getMessage()}\n");
+            fwrite(STDERR, "drain warning: {$e->getMessage()}\n");
         }
     } else {
         usleep(10000);

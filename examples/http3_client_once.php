@@ -85,7 +85,7 @@ $streamResetError = null;
 $goawayError = null;
 
 while (microtime(true) < $deadline && !$quic->isClosed() && !$http3->isClosing()) {
-    foreach ($quic->flush() as $outgoing) {
+    foreach ($quic->drainOutgoingDatagrams() as $outgoing) {
         stream_socket_sendto($udp, $outgoing->getPayload());
     }
 

@@ -1,5 +1,5 @@
 --TEST--
-Phase 5 real-adapter path works with stub QUIC object (open/write/end/poll/close)
+Phase 5 real-adapter path works with stub QUIC object (open/write/end/drain/close)
 --SKIPIF--
 <?php
 if (!extension_loaded('nghttp3')) {
@@ -81,7 +81,7 @@ final class StubNgtcp2Connection {
         return $this->streams[$streamId] ?? null;
     }
 
-    public function pollEvents(): array {
+    public function drainEvents(): array {
         $events = $this->events;
         $this->events = [];
         return $events;

@@ -39,7 +39,7 @@ $s2->submitHeaders([
 $s2->submitData('b');
 $s2->end();
 
-$datagrams = $quic->flush();
+$datagrams = $quic->drainOutgoingDatagrams();
 $events = $http3->pollEvents();
 
 var_dump($s1->getId() === 0);
