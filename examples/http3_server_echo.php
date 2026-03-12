@@ -65,6 +65,26 @@ function parsePeerAddress(string $peer): Address
     return new Address(substr($peer, 0, $pos), (int)substr($peer, $pos + 1));
 }
 
+function resolveWaitTimeoutMs(?ServerConnection $serverConn, int $defaultMs = 100): int
+{
+    if (!$serverConn instanceof ServerConnection) {
+        return $defaultMs;
+    }
+
+    $next = $serverConn->getNextTimeout();
+    if (!is_int($next)) {
+        return $defaultMs;
+    }
+    if ($next < 0) {
+        return 0;
+    }
+    if ($next > $defaultMs) {
+        return $defaultMs;
+    }
+
+    return $next;
+}
+
 if (!extension_loaded('ngtcp2') || !extension_loaded('nghttp3')) {
     fwrite(STDERR, "ngtcp2 and nghttp3 extensions must be loaded\n");
     exit(2);
@@ -116,7 +136,19 @@ $responded = [];
 $deadline = microtime(true) + ($timeoutMs / 1000.0);
 
 while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isClosed())) {
-    $packet = stream_socket_recvfrom($udp, 65535, 0, $from);
+    $waitMs = resolveWaitTimeoutMs($serverConn);
+    $sec = intdiv($waitMs, 1000);
+    $usec = ($waitMs % 1000) * 1000;
+    $read = [$udp];
+    $write = null;
+    $except = null;
+    $ready = stream_select($read, $write, $except, $sec, $usec);
+    if ($ready === false) {
+        throw new RuntimeException('stream_select failed');
+    }
+
+    $from = null;
+    $packet = $ready > 0 ? stream_socket_recvfrom($udp, 65535, 0, $from) : false;
     if (is_string($packet) && $packet !== '' && is_string($from) && $from !== '') {
         $peer = $from;
         $remote = parsePeerAddress($from);
@@ -194,8 +226,6 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
         } catch (Throwable $e) {
             fwrite(STDERR, "drain warning: {$e->getMessage()}\n");
         }
-    } else {
-        usleep(10000);
     }
 }
 
