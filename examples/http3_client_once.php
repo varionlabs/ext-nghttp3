@@ -12,6 +12,31 @@ use Varion\Nghttp3\Events\RequestCompleted;
 use Varion\Nghttp3\Events\StreamReset;
 use Varion\Nghttp3\Http3Connection;
 
+function resolveWaitTimeoutMs(Connection $quic, int $maxWaitMs = 100): int
+{
+    if (method_exists($quic, 'getTimeoutAt')) {
+        $timeoutAt = $quic->getTimeoutAt();
+        if (is_int($timeoutAt)) {
+            $nowMs = (int)floor(microtime(true) * 1000);
+            $remaining = $timeoutAt - $nowMs;
+            if ($remaining < 0) {
+                return 0;
+            }
+            return min($remaining, $maxWaitMs);
+        }
+    }
+
+    $nextTimeout = $quic->getNextTimeout();
+    if (!is_int($nextTimeout)) {
+        return $maxWaitMs;
+    }
+    if ($nextTimeout < 0) {
+        return 0;
+    }
+
+    return min($nextTimeout, $maxWaitMs);
+}
+
 function usage(): void
 {
     fwrite(STDERR, <<<TXT
@@ -89,18 +114,9 @@ while (microtime(true) < $deadline && !$quic->isClosed() && !$http3->isClosing()
         stream_socket_sendto($udp, $outgoing->getPayload());
     }
 
-    $nextTimeout = $quic->getNextTimeout();
-    if ($nextTimeout === null) {
-        $sec = 0;
-        $usec = 100000;
-    } else {
-        if ($nextTimeout < 0) {
-            $nextTimeout = 0;
-        }
-        $nextTimeout = min($nextTimeout, 100);
-        $sec = intdiv($nextTimeout, 1000);
-        $usec = ($nextTimeout % 1000) * 1000;
-    }
+    $waitMs = resolveWaitTimeoutMs($quic);
+    $sec = intdiv($waitMs, 1000);
+    $usec = ($waitMs % 1000) * 1000;
 
     $read = [$udp];
     $write = null;

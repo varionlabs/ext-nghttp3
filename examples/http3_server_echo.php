@@ -71,6 +71,18 @@ function resolveWaitTimeoutMs(?ServerConnection $serverConn, int $defaultMs = 10
         return $defaultMs;
     }
 
+    if (method_exists($serverConn, 'getTimeoutAt')) {
+        $timeoutAt = $serverConn->getTimeoutAt();
+        if (is_int($timeoutAt)) {
+            $nowMs = (int)floor(microtime(true) * 1000);
+            $remaining = $timeoutAt - $nowMs;
+            if ($remaining < 0) {
+                return 0;
+            }
+            return min($remaining, $defaultMs);
+        }
+    }
+
     $next = $serverConn->getNextTimeout();
     if (!is_int($next)) {
         return $defaultMs;

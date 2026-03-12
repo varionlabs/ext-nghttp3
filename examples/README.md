@@ -9,7 +9,8 @@
 3. Drive network I/O in userland (Sans-I/O):
    - `recv(Datagram)` on incoming UDP packets
    - `drainOutgoingDatagrams()` for outgoing QUIC datagrams
-   - `getNextTimeout()` to compute your socket wait timeout
+   - `getTimeoutAt()` (or `getNextExpiry()`) to compute socket wait timeout
+   - fallback: `getNextTimeout()` for older ngtcp2 builds
    - call `handleTimers()` when that timer expires (it acts as timer processing, not socket-timeout callback)
 4. Build request headers as `[[name, value], ...]` pairs:
    - Include pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`)
