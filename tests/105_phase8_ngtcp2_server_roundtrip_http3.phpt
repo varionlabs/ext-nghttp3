@@ -144,14 +144,14 @@ try {
                 $serverConn->recv($dgram);
             }
         } elseif ($serverConn instanceof ServerConnection) {
-            $serverConn->onTimeout();
+            $serverConn->handleTimers();
         }
 
         $cpkt = stream_socket_recvfrom($clientSock, 65535, 0, $peer2);
         if (is_string($cpkt) && $cpkt !== '') {
             $clientConn->recv(new Datagram($cpkt, $serverAddr));
         } else {
-            $clientConn->onTimeout();
+            $clientConn->handleTimers();
         }
 
         if ($serverHttp3 instanceof Varion\Nghttp3\Http3Connection) {

@@ -116,7 +116,7 @@ while (microtime(true) < $deadline && !$quic->isClosed() && !$http3->isClosing()
             $quic->recv(new Datagram($packet, $remote));
         }
     } else {
-        $quic->onTimeout();
+        $quic->handleTimers();
     }
 
     foreach ($http3->pollEvents() as $event) {

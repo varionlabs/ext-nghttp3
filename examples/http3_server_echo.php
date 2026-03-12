@@ -171,7 +171,7 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
         }
     } elseif ($serverConn instanceof ServerConnection) {
         try {
-            $serverConn->onTimeout();
+            $serverConn->handleTimers();
         } catch (Throwable $e) {
             fwrite(STDERR, "timeout warning: {$e->getMessage()}\n");
         }

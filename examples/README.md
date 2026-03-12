@@ -10,7 +10,7 @@
    - `recv(Datagram)` on incoming UDP packets
    - `drainOutgoingDatagrams()` for outgoing QUIC datagrams
    - `getNextTimeout()` to compute your socket wait timeout
-   - call `onTimeout()` when that timer expires (it acts as timer processing, not socket-timeout callback)
+   - call `handleTimers()` when that timer expires (it acts as timer processing, not socket-timeout callback)
 4. Build request headers as `[[name, value], ...]` pairs:
    - Include pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`)
 5. Consume HTTP/3 events via `Http3Connection::pollEvents()`:
