@@ -12,6 +12,70 @@ use Varion\Nghttp3\Events\RequestCompleted;
 use Varion\Nghttp3\Events\StreamReset;
 use Varion\Nghttp3\Http3Connection;
 
+if (!extension_loaded('ngtcp2')) {
+    fwrite(STDERR, "ngtcp2 extension must be loaded\n");
+    exit(2);
+}
+if (!extension_loaded('nghttp3')) {
+    fwrite(STDERR, "nghttp3 extension must be loaded\n");
+    exit(2);
+}
+
+$options = getopt('', ['host::', 'port::', 'cert::', 'key::', 'alpn::', 'prefix::', 'timeout-ms::', 'help']);
+if ($options === false) {
+    usage();
+    exit(2);
+}
+if (isset($options['help'])) {
+    usage();
+    exit(0);
+}
+
+$host = is_string($options['host'] ?? null) ? $options['host'] : '127.0.0.1';
+$port = (int)($options['port'] ?? 4433);
+$cert = is_string($options['cert'] ?? null) ? $options['cert'] : '/tmp/nghttp3/server.crt';
+$key = is_string($options['key'] ?? null) ? $options['key'] : '/tmp/nghttp3/server.key';
+$alpn = is_string($options['alpn'] ?? null) ? $options['alpn'] : 'h3';
+$prefix = is_string($options['prefix'] ?? null) ? $options['prefix'] : 'echo: ';
+$timeoutMs = (int)($options['timeout-ms'] ?? 0);
+
+if ($port <= 0 || $port > 65535) {
+    throw new InvalidArgumentException("invalid --port: {$port}");
+}
+if ($timeoutMs < 0) {
+    throw new InvalidArgumentException("invalid --timeout-ms: {$timeoutMs}");
+}
+if (!is_executable('/usr/bin/openssl')) {
+    throw new RuntimeException('/usr/bin/openssl is not available');
+}
+
+ensureCertificate($cert, $key, $host);
+
+$udp = stream_socket_server("udp://{$host}:{$port}", $errno, $errstr, STREAM_SERVER_BIND);
+if ($udp === false) {
+    throw new RuntimeException("failed to bind UDP socket: ({$errno}) {$errstr}");
+}
+stream_set_blocking($udp, false);
+
+fwrite(STDERR, "http3 echo server waiting on {$host}:{$port}\n");
+
+$sessions = [];
+$deadline = $timeoutMs > 0 ? microtime(true) + ($timeoutMs / 1000.0) : null;
+while ($deadline === null || microtime(true) < $deadline) {
+    // 1) Wait for a packet (or timer tick).
+    [$packet, $from] = readUdpPacket($udp, $sessions);
+
+    // 2) Apply received packet to a peer session.
+    ingestIncomingPacket($sessions, $packet, $from, $host, $port, $cert, $key, $alpn);
+
+    // 3) Advance every session: timers -> HTTP/3 events -> outbound datagrams.
+    runAllSessions($sessions, $prefix, $udp);
+}
+
+if (is_resource($udp)) {
+    fclose($udp);
+}
+
 function usage(): void
 {
     fwrite(STDERR, <<<TXT
@@ -312,68 +376,4 @@ function runAllSessions(array &$sessions, string $prefix, $udp): void
     foreach ($closedPeers as $closedPeer) {
         unset($sessions[$closedPeer]);
     }
-}
-
-if (!extension_loaded('ngtcp2')) {
-    fwrite(STDERR, "ngtcp2 extension must be loaded\n");
-    exit(2);
-}
-if (!extension_loaded('nghttp3')) {
-    fwrite(STDERR, "nghttp3 extension must be loaded\n");
-    exit(2);
-}
-
-$options = getopt('', ['host::', 'port::', 'cert::', 'key::', 'alpn::', 'prefix::', 'timeout-ms::', 'help']);
-if ($options === false) {
-    usage();
-    exit(2);
-}
-if (isset($options['help'])) {
-    usage();
-    exit(0);
-}
-
-$host = is_string($options['host'] ?? null) ? $options['host'] : '127.0.0.1';
-$port = (int)($options['port'] ?? 4433);
-$cert = is_string($options['cert'] ?? null) ? $options['cert'] : '/tmp/nghttp3/server.crt';
-$key = is_string($options['key'] ?? null) ? $options['key'] : '/tmp/nghttp3/server.key';
-$alpn = is_string($options['alpn'] ?? null) ? $options['alpn'] : 'h3';
-$prefix = is_string($options['prefix'] ?? null) ? $options['prefix'] : 'echo: ';
-$timeoutMs = (int)($options['timeout-ms'] ?? 0);
-
-if ($port <= 0 || $port > 65535) {
-    throw new InvalidArgumentException("invalid --port: {$port}");
-}
-if ($timeoutMs < 0) {
-    throw new InvalidArgumentException("invalid --timeout-ms: {$timeoutMs}");
-}
-if (!is_executable('/usr/bin/openssl')) {
-    throw new RuntimeException('/usr/bin/openssl is not available');
-}
-
-ensureCertificate($cert, $key, $host);
-
-$udp = stream_socket_server("udp://{$host}:{$port}", $errno, $errstr, STREAM_SERVER_BIND);
-if ($udp === false) {
-    throw new RuntimeException("failed to bind UDP socket: ({$errno}) {$errstr}");
-}
-stream_set_blocking($udp, false);
-
-fwrite(STDERR, "http3 echo server waiting on {$host}:{$port}\n");
-
-$sessions = [];
-$deadline = $timeoutMs > 0 ? microtime(true) + ($timeoutMs / 1000.0) : null;
-while ($deadline === null || microtime(true) < $deadline) {
-    // 1) Wait for a packet (or timer tick).
-    [$packet, $from] = readUdpPacket($udp, $sessions);
-
-    // 2) Apply received packet to a peer session.
-    ingestIncomingPacket($sessions, $packet, $from, $host, $port, $cert, $key, $alpn);
-
-    // 3) Advance every session: timers -> HTTP/3 events -> outbound datagrams.
-    runAllSessions($sessions, $prefix, $udp);
-}
-
-if (is_resource($udp)) {
-    fclose($udp);
 }
