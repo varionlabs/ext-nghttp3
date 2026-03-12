@@ -18,7 +18,7 @@ function usage(): void
 Usage:
   php examples/http3_server_echo.php [--host=127.0.0.1] [--port=4433]
                                      [--cert=/tmp/nghttp3/server.crt] [--key=/tmp/nghttp3/server.key]
-                                     [--alpn=h3] [--prefix='echo: '] [--timeout-ms=30000]
+                                     [--alpn=h3] [--prefix='echo: '] [--timeout-ms=0]
 
 TXT);
 }
@@ -134,12 +134,12 @@ $cert = is_string($options['cert'] ?? null) ? $options['cert'] : '/tmp/nghttp3/s
 $key = is_string($options['key'] ?? null) ? $options['key'] : '/tmp/nghttp3/server.key';
 $alpn = is_string($options['alpn'] ?? null) ? $options['alpn'] : 'h3';
 $prefix = is_string($options['prefix'] ?? null) ? $options['prefix'] : 'echo: ';
-$timeoutMs = (int)($options['timeout-ms'] ?? 30000);
+$timeoutMs = (int)($options['timeout-ms'] ?? 0);
 
 if ($port <= 0 || $port > 65535) {
     throw new InvalidArgumentException("invalid --port: {$port}");
 }
-if ($timeoutMs <= 0) {
+if ($timeoutMs < 0) {
     throw new InvalidArgumentException("invalid --timeout-ms: {$timeoutMs}");
 }
 if (!is_executable('/usr/bin/openssl')) {
@@ -157,9 +157,8 @@ stream_set_blocking($udp, false);
 fwrite(STDERR, "http3 echo server waiting on {$host}:{$port}\n");
 
 $sessions = [];
-$deadline = microtime(true) + ($timeoutMs / 1000.0);
-
-while (microtime(true) < $deadline) {
+$deadline = $timeoutMs > 0 ? microtime(true) + ($timeoutMs / 1000.0) : null;
+while ($deadline === null || microtime(true) < $deadline) {
     $waitMs = resolveWaitTimeoutMs($sessions);
     $sec = intdiv($waitMs, 1000);
     $usec = ($waitMs % 1000) * 1000;
