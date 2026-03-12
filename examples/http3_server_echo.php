@@ -113,8 +113,12 @@ function resolveWaitTimeoutMs(array $sessions, int $defaultMs = 100): int
     return min($best, $defaultMs);
 }
 
-if (!extension_loaded('ngtcp2') || !extension_loaded('nghttp3')) {
-    fwrite(STDERR, "ngtcp2 and nghttp3 extensions must be loaded\n");
+if (!extension_loaded('ngtcp2')) {
+    fwrite(STDERR, "ngtcp2 extension must be loaded\n");
+    exit(2);
+}
+if (!extension_loaded('nghttp3')) {
+    fwrite(STDERR, "nghttp3 extension must be loaded\n");
     exit(2);
 }
 
