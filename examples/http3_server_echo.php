@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Varion\Ngtcp2\Address;
 use Varion\Ngtcp2\Datagram;
+use Varion\Ngtcp2\ServerConfig;
 use Varion\Ngtcp2\ServerConnection;
 use Varion\Nghttp3\Events\DataReceived;
 use Varion\Nghttp3\Events\HeadersReceived;
@@ -168,11 +169,12 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
         $dgram = new Datagram($packet, $remote, $local);
 
         if (!$serverConn instanceof ServerConnection) {
-            $serverConn = ServerConnection::accept($dgram, $local, [
-                'certFile' => $cert,
-                'keyFile' => $key,
-                'alpn' => $alpn,
-            ]);
+            $serverConn = ServerConnection::accept(
+                $dgram,
+                (new ServerConfig())
+                    ->withCertificate($cert, $key)
+                    ->withAlpn($alpn)
+            );
             $http3 = new Http3Connection($serverConn);
         } else {
             try {

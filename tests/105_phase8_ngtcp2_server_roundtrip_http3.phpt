@@ -29,6 +29,7 @@ declare(strict_types=1);
 use Varion\Ngtcp2\Address;
 use Varion\Ngtcp2\Connection;
 use Varion\Ngtcp2\Datagram;
+use Varion\Ngtcp2\ServerConfig;
 use Varion\Ngtcp2\ServerConnection;
 use Varion\Nghttp3\Events\DataReceived;
 use Varion\Nghttp3\Events\HeadersReceived;
@@ -134,11 +135,12 @@ try {
             $dgram = new Datagram($packet, $remote, $local);
 
             if (!$serverConn instanceof ServerConnection) {
-                $serverConn = ServerConnection::accept($dgram, $local, [
-                    'certFile' => $cert,
-                    'keyFile' => $key,
-                    'alpn' => 'h3',
-                ]);
+                $serverConn = ServerConnection::accept(
+                    $dgram,
+                    (new ServerConfig())
+                        ->withCertificate($cert, $key)
+                        ->withAlpn('h3')
+                );
                 $serverHttp3 = new Varion\Nghttp3\Http3Connection($serverConn);
             } else {
                 $serverConn->recv($dgram);
