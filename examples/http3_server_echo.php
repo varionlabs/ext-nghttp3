@@ -66,36 +66,51 @@ function parsePeerAddress(string $peer): Address
     return new Address(substr($peer, 0, $pos), (int)substr($peer, $pos + 1));
 }
 
-function resolveWaitTimeoutMs(?ServerConnection $serverConn, int $defaultMs = 100): int
+function resolveWaitTimeoutMs(array $sessions, int $defaultMs = 100): int
 {
-    if (!$serverConn instanceof ServerConnection) {
+    if ($sessions === []) {
         return $defaultMs;
     }
 
-    if (method_exists($serverConn, 'getTimeoutAt')) {
-        $timeoutAt = $serverConn->getTimeoutAt();
-        if (is_int($timeoutAt)) {
-            $nowMs = (int)floor(microtime(true) * 1000);
-            $remaining = $timeoutAt - $nowMs;
-            if ($remaining < 0) {
-                return 0;
+    $best = $defaultMs;
+    foreach ($sessions as $session) {
+        $serverConn = $session['conn'] ?? null;
+        if (!$serverConn instanceof ServerConnection) {
+            continue;
+        }
+
+        if (method_exists($serverConn, 'getTimeoutAt')) {
+            $timeoutAt = $serverConn->getTimeoutAt();
+            if (is_int($timeoutAt)) {
+                $nowMs = (int)floor(microtime(true) * 1000);
+                $remaining = $timeoutAt - $nowMs;
+                if ($remaining < 0) {
+                    return 0;
+                }
+                if ($remaining < $best) {
+                    $best = $remaining;
+                }
+                continue;
             }
-            return min($remaining, $defaultMs);
+        }
+
+        $next = $serverConn->getNextTimeout();
+        if (!is_int($next)) {
+            continue;
+        }
+        if ($next < 0) {
+            return 0;
+        }
+        if ($next < $best) {
+            $best = $next;
         }
     }
 
-    $next = $serverConn->getNextTimeout();
-    if (!is_int($next)) {
-        return $defaultMs;
-    }
-    if ($next < 0) {
+    if ($best < 0) {
         return 0;
     }
-    if ($next > $defaultMs) {
-        return $defaultMs;
-    }
 
-    return $next;
+    return min($best, $defaultMs);
 }
 
 if (!extension_loaded('ngtcp2') || !extension_loaded('nghttp3')) {
@@ -141,15 +156,11 @@ stream_set_blocking($udp, false);
 
 fwrite(STDERR, "http3 echo server waiting on {$host}:{$port}\n");
 
-$serverConn = null;
-$http3 = null;
-$peer = null;
-$requestBodies = [];
-$responded = [];
+$sessions = [];
 $deadline = microtime(true) + ($timeoutMs / 1000.0);
 
-while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isClosed())) {
-    $waitMs = resolveWaitTimeoutMs($serverConn);
+while (microtime(true) < $deadline) {
+    $waitMs = resolveWaitTimeoutMs($sessions);
     $sec = intdiv($waitMs, 1000);
     $usec = ($waitMs % 1000) * 1000;
     $read = [$udp];
@@ -163,35 +174,63 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
     $from = null;
     $packet = $ready > 0 ? stream_socket_recvfrom($udp, 65535, 0, $from) : false;
     if (is_string($packet) && $packet !== '' && is_string($from) && $from !== '') {
-        $peer = $from;
-        $remote = parsePeerAddress($from);
-        $local = new Address($host, $port);
-        $dgram = new Datagram($packet, $remote, $local);
+        if (!array_key_exists($from, $sessions)) {
+            $remote = parsePeerAddress($from);
+            $local = new Address($host, $port);
+            $dgram = new Datagram($packet, $remote, $local);
 
-        if (!$serverConn instanceof ServerConnection) {
-            $serverConn = ServerConnection::accept(
-                $dgram,
-                (new ServerConfig())
-                    ->withCertificate($cert, $key)
-                    ->withAlpn($alpn)
-            );
-            $http3 = new Http3Connection($serverConn);
+            try {
+                $serverConn = ServerConnection::accept(
+                    $dgram,
+                    (new ServerConfig())
+                        ->withCertificate($cert, $key)
+                        ->withAlpn($alpn)
+                );
+                $sessions[$from] = [
+                    'conn' => $serverConn,
+                    'http3' => new Http3Connection($serverConn),
+                    'requestBodies' => [],
+                    'responded' => [],
+                ];
+                fwrite(STDERR, "accepted peer {$from}\n");
+            } catch (Throwable $e) {
+                fwrite(STDERR, "accept warning for {$from}: {$e->getMessage()}\n");
+            }
         } else {
+            $session = $sessions[$from];
+            $serverConn = $session['conn'] ?? null;
+            if (!$serverConn instanceof ServerConnection) {
+                continue;
+            }
+
+            $remote = parsePeerAddress($from);
+            $local = new Address($host, $port);
+            $dgram = new Datagram($packet, $remote, $local);
+
             try {
                 $serverConn->recv($dgram);
             } catch (Throwable $e) {
                 fwrite(STDERR, "recv warning: {$e->getMessage()}\n");
             }
         }
-    } elseif ($serverConn instanceof ServerConnection) {
+    }
+
+    $closedPeers = [];
+    foreach ($sessions as $peer => &$session) {
+        $serverConn = $session['conn'] ?? null;
+        $http3 = $session['http3'] ?? null;
+        if (!$serverConn instanceof ServerConnection || !$http3 instanceof Http3Connection) {
+            continue;
+        }
+
         try {
             $serverConn->handleTimers();
         } catch (Throwable $e) {
             fwrite(STDERR, "timeout warning: {$e->getMessage()}\n");
         }
-    }
 
-    if ($http3 instanceof Http3Connection) {
+        $requestBodies = &$session['requestBodies'];
+        $responded = &$session['responded'];
         foreach ($http3->pollEvents() as $event) {
             if ($event instanceof DataReceived) {
                 $requestBodies[$event->getStreamId()] = ($requestBodies[$event->getStreamId()] ?? '') . $event->getPayload();
@@ -217,7 +256,7 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
                 $stream->submitData($prefix . $body);
                 $stream->end();
                 $responded[$streamId] = true;
-                fwrite(STDERR, "responded stream {$streamId}\n");
+                fwrite(STDERR, "responded peer {$peer} stream {$streamId}\n");
                 continue;
             }
 
@@ -230,9 +269,7 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
                 fwrite(STDERR, "stream reset {$event->getStreamId()} error={$event->getErrorCode()}\n");
             }
         }
-    }
 
-    if ($serverConn instanceof ServerConnection && is_string($peer) && $peer !== '') {
         try {
             foreach ($serverConn->drainOutgoingDatagrams() as $outgoing) {
                 stream_socket_sendto($udp, $outgoing->getPayload(), 0, $peer);
@@ -240,6 +277,15 @@ while (microtime(true) < $deadline && ($serverConn === null || !$serverConn->isC
         } catch (Throwable $e) {
             fwrite(STDERR, "drain warning: {$e->getMessage()}\n");
         }
+
+        if ($serverConn->isClosed()) {
+            $closedPeers[] = $peer;
+            fwrite(STDERR, "closed peer {$peer}\n");
+        }
+    }
+    unset($session, $requestBodies, $responded);
+    foreach ($closedPeers as $closedPeer) {
+        unset($sessions[$closedPeer]);
     }
 }
 
