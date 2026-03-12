@@ -1,5 +1,5 @@
 --TEST--
-Phase 8 integration: Http3Connection can parse request on ServerConnection and send response
+Phase 8 integration: GET request with empty body completes without stream write-side crash
 --SKIPIF--
 <?php
 if (!extension_loaded('nghttp3')) {
@@ -97,12 +97,11 @@ try {
     $clientHttp3 = new Varion\Nghttp3\Http3Connection($clientConn);
     $clientStream = $clientHttp3->createRequestStream();
     $clientStream->submitHeaders([
-        [':method', 'POST'],
+        [':method', 'GET'],
         [':scheme', 'https'],
         [':authority', 'example.com'],
-        [':path', '/echo'],
+        [':path', '/'],
     ]);
-    $clientStream->submitData('hello');
     $clientStream->end();
 
     $serverConn = null;
@@ -202,7 +201,7 @@ try {
 
     var_dump($serverResponded);
     var_dump($serverRequestCompleted);
-    var_dump($serverRequestPayload === 'hello');
+    var_dump($serverRequestPayload === '');
     var_dump($clientResponseCompleted);
     var_dump($clientResponsePayload === 'pong');
 } finally {

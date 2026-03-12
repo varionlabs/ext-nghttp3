@@ -1,5 +1,5 @@
 --TEST--
-Phase 8 integration: Http3Connection can parse request on ServerConnection and send response
+Phase 8 integration: two empty-body GET streams complete on one ServerConnection
 --SKIPIF--
 <?php
 if (!extension_loaded('nghttp3')) {
@@ -95,25 +95,37 @@ try {
 
     $clientConn = new Connection($serverAddr);
     $clientHttp3 = new Varion\Nghttp3\Http3Connection($clientConn);
-    $clientStream = $clientHttp3->createRequestStream();
-    $clientStream->submitHeaders([
-        [':method', 'POST'],
+
+    $stream1 = $clientHttp3->createRequestStream();
+    $stream1->submitHeaders([
+        [':method', 'GET'],
         [':scheme', 'https'],
         [':authority', 'example.com'],
-        [':path', '/echo'],
+        [':path', '/one'],
     ]);
-    $clientStream->submitData('hello');
-    $clientStream->end();
+    $stream1->end();
+
+    $stream2 = $clientHttp3->createRequestStream();
+    $stream2->submitHeaders([
+        [':method', 'GET'],
+        [':scheme', 'https'],
+        [':authority', 'example.com'],
+        [':path', '/two'],
+    ]);
+    $stream2->end();
+
+    $stream1Id = $stream1->getId();
+    $stream2Id = $stream2->getId();
 
     $serverConn = null;
     $serverHttp3 = null;
     $serverPeer = null;
 
-    $serverRequestPayload = '';
-    $serverRequestCompleted = false;
-    $serverResponded = false;
-    $clientResponsePayload = '';
-    $clientResponseCompleted = false;
+    $serverRequestPayloads = [];
+    $serverCompleted = [];
+    $serverResponded = [];
+    $clientResponsePayloads = [];
+    $clientCompleted = [];
 
     $deadline = microtime(true) + 8.0;
     while (microtime(true) < $deadline && !$clientConn->isClosed()) {
@@ -159,52 +171,63 @@ try {
         if ($serverHttp3 instanceof Varion\Nghttp3\Http3Connection) {
             foreach ($serverHttp3->pollEvents() as $event) {
                 if ($event instanceof DataReceived) {
-                    $serverRequestPayload .= $event->getPayload();
+                    $sid = $event->getStreamId();
+                    $serverRequestPayloads[$sid] = ($serverRequestPayloads[$sid] ?? '') . $event->getPayload();
                     continue;
                 }
 
-                if ($event instanceof HeadersReceived && !$serverResponded) {
-                    $stream = $serverHttp3->getRequestStream($event->getStreamId());
-                    if ($stream !== null) {
-                        $stream->submitHeaders([
+                if ($event instanceof HeadersReceived) {
+                    $sid = $event->getStreamId();
+                    if (($serverResponded[$sid] ?? false) === true) {
+                        continue;
+                    }
+
+                    $requestStream = $serverHttp3->getRequestStream($sid);
+                    if ($requestStream !== null) {
+                        $requestStream->submitHeaders([
                             [':status', '200'],
                             ['content-type', 'text/plain'],
                         ]);
-                        $stream->submitData('pong');
-                        $stream->end();
-                        $serverResponded = true;
+                        $requestStream->submitData('pong-' . $sid);
+                        $requestStream->end();
+                        $serverResponded[$sid] = true;
                     }
                     continue;
                 }
 
                 if ($event instanceof RequestCompleted) {
-                    $serverRequestCompleted = true;
+                    $serverCompleted[$event->getStreamId()] = true;
                 }
             }
         }
 
         foreach ($clientHttp3->pollEvents() as $event) {
             if ($event instanceof DataReceived) {
-                $clientResponsePayload .= $event->getPayload();
+                $sid = $event->getStreamId();
+                $clientResponsePayloads[$sid] = ($clientResponsePayloads[$sid] ?? '') . $event->getPayload();
                 continue;
             }
 
             if ($event instanceof RequestCompleted) {
-                $clientResponseCompleted = true;
-                break;
+                $clientCompleted[$event->getStreamId()] = true;
             }
         }
 
-        if ($clientResponseCompleted && $serverRequestCompleted) {
+        if (($serverCompleted[$stream1Id] ?? false) &&
+            ($serverCompleted[$stream2Id] ?? false) &&
+            ($clientCompleted[$stream1Id] ?? false) &&
+            ($clientCompleted[$stream2Id] ?? false)) {
             break;
         }
     }
 
-    var_dump($serverResponded);
-    var_dump($serverRequestCompleted);
-    var_dump($serverRequestPayload === 'hello');
-    var_dump($clientResponseCompleted);
-    var_dump($clientResponsePayload === 'pong');
+    var_dump(($serverResponded[$stream1Id] ?? false) && ($serverResponded[$stream2Id] ?? false));
+    var_dump(($serverCompleted[$stream1Id] ?? false) && ($serverCompleted[$stream2Id] ?? false));
+    var_dump(($serverRequestPayloads[$stream1Id] ?? '') === '');
+    var_dump(($serverRequestPayloads[$stream2Id] ?? '') === '');
+    var_dump(($clientCompleted[$stream1Id] ?? false) && ($clientCompleted[$stream2Id] ?? false));
+    var_dump(($clientResponsePayloads[$stream1Id] ?? '') === 'pong-' . $stream1Id);
+    var_dump(($clientResponsePayloads[$stream2Id] ?? '') === 'pong-' . $stream2Id);
 } finally {
     if (is_resource($clientSock)) {
         fclose($clientSock);
@@ -218,6 +241,8 @@ try {
 }
 ?>
 --EXPECT--
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)
