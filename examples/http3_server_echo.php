@@ -12,16 +12,8 @@ use Varion\Nghttp3\Events\RequestCompleted;
 use Varion\Nghttp3\Events\StreamReset;
 use Varion\Nghttp3\Http3Connection;
 
-if (!extension_loaded('ngtcp2')) {
-    fwrite(STDERR, "ngtcp2 extension must be loaded\n");
-    exit(2);
-}
-if (!extension_loaded('nghttp3')) {
-    fwrite(STDERR, "nghttp3 extension must be loaded\n");
-    exit(2);
-}
-
-$options = getopt('', ['host::', 'port::', 'cert::', 'key::', 'alpn::', 'prefix::', 'timeout-ms::', 'help']);
+$optind = 0;
+$options = getopt('', ['address::', 'alpn::', 'prefix::', 'timeout-ms::', 'help'], $optind);
 if ($options === false) {
     usage();
     exit(2);
@@ -31,16 +23,32 @@ if (isset($options['help'])) {
     exit(0);
 }
 
-$host = is_string($options['host'] ?? null) ? $options['host'] : '127.0.0.1';
-$port = (int)($options['port'] ?? 4433);
-$cert = is_string($options['cert'] ?? null) ? $options['cert'] : '/tmp/nghttp3/server.crt';
-$key = is_string($options['key'] ?? null) ? $options['key'] : '/tmp/nghttp3/server.key';
+if (!extension_loaded('ngtcp2')) {
+    fwrite(STDERR, "ngtcp2 extension must be loaded\n");
+    exit(2);
+}
+if (!extension_loaded('nghttp3')) {
+    fwrite(STDERR, "nghttp3 extension must be loaded\n");
+    exit(2);
+}
+
+$args = array_slice($argv, $optind);
+if (count($args) !== 1 && count($args) !== 3) {
+    usage();
+    exit(2);
+}
+
+$host = is_string($options['address'] ?? null) ? $options['address'] : '127.0.0.1';
+$port = (int)$args[0];
+$useProvidedCredentials = count($args) === 3;
+$key = $useProvidedCredentials ? $args[1] : '/tmp/nghttp3/server.key';
+$cert = $useProvidedCredentials ? $args[2] : '/tmp/nghttp3/server.crt';
 $alpn = is_string($options['alpn'] ?? null) ? $options['alpn'] : 'h3';
 $prefix = is_string($options['prefix'] ?? null) ? $options['prefix'] : 'echo: ';
 $timeoutMs = (int)($options['timeout-ms'] ?? 0);
 
 if ($port <= 0 || $port > 65535) {
-    throw new InvalidArgumentException("invalid --port: {$port}");
+    throw new InvalidArgumentException("invalid <PORT>: {$port}");
 }
 if ($timeoutMs < 0) {
     throw new InvalidArgumentException("invalid --timeout-ms: {$timeoutMs}");
@@ -49,7 +57,16 @@ if (!is_executable('/usr/bin/openssl')) {
     throw new RuntimeException('/usr/bin/openssl is not available');
 }
 
-ensureCertificate($cert, $key, $host);
+if ($useProvidedCredentials) {
+    if (!is_file($key)) {
+        throw new RuntimeException("private key file does not exist: {$key}");
+    }
+    if (!is_file($cert)) {
+        throw new RuntimeException("certificate file does not exist: {$cert}");
+    }
+} else {
+    ensureCertificate($cert, $key, $host);
+}
 
 $udp = stream_socket_server("udp://{$host}:{$port}", $errno, $errstr, STREAM_SERVER_BIND);
 if ($udp === false) {
@@ -80,9 +97,16 @@ function usage(): void
 {
     fwrite(STDERR, <<<TXT
 Usage:
-  php examples/http3_server_echo.php [--host=127.0.0.1] [--port=4433]
-                                     [--cert=/tmp/nghttp3/server.crt] [--key=/tmp/nghttp3/server.key]
+  php examples/http3_server_echo.php <PORT> [<PRIVATE_KEY> <CERT>] [--address=ADDR]
                                      [--alpn=h3] [--prefix='echo: '] [--timeout-ms=0]
+
+Port examples:
+  php examples/http3_server_echo.php 4433
+  php examples/http3_server_echo.php 8443 /tmp/nghttp3/server.key /tmp/nghttp3/server.crt --address=0.0.0.0
+
+HTTP/3 curl test (-v):
+  curl -v --http3 --insecure https://127.0.0.1:4433/ -d 'hello'
+  curl -v --http3 --insecure https://127.0.0.1:4433/ -d 'again'
 
 TXT);
 }
