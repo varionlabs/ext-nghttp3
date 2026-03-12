@@ -73,6 +73,9 @@ if ($udp === false) {
     throw new RuntimeException("failed to bind UDP socket: ({$errno}) {$errstr}");
 }
 stream_set_blocking($udp, false);
+$localName = stream_socket_get_name($udp, false);
+$localEndpoint = is_string($localName) && $localName !== '' ? $localName : formatEndpoint($host, $port);
+$localAddress = Address::fromString($localEndpoint);
 
 fwrite(STDERR, "http3 echo server waiting on {$host}:{$port}\n");
 
@@ -83,7 +86,7 @@ while ($deadline === null || microtime(true) < $deadline) {
     [$packet, $from] = readUdpPacket($udp, $sessions);
 
     // 2) Apply received packet to a peer session.
-    ingestIncomingPacket($sessions, $packet, $from, $host, $port, $cert, $key, $alpn);
+    ingestIncomingPacket($sessions, $packet, $from, $localAddress, $cert, $key, $alpn);
 
     // 3) Advance every session: timers -> HTTP/3 events -> outbound datagrams.
     runAllSessions($sessions, $prefix, $udp);
@@ -140,18 +143,13 @@ function ensureCertificate(string $certPath, string $keyPath, string $host): voi
     }
 }
 
-function parsePeerAddress(string $peer): Address
+function formatEndpoint(string $host, int $port): string
 {
-    if (preg_match('/^\[(.+)\]:(\d+)$/', $peer, $m) === 1) {
-        return new Address($m[1], (int)$m[2]);
+    if (strpos($host, ':') !== false && strpos($host, '[') !== 0) {
+        return "[{$host}]:{$port}";
     }
 
-    $pos = strrpos($peer, ':');
-    if ($pos === false) {
-        throw new RuntimeException("cannot parse peer address: {$peer}");
-    }
-
-    return new Address(substr($peer, 0, $pos), (int)substr($peer, $pos + 1));
+    return "{$host}:{$port}";
 }
 
 function resolveWaitTimeoutMs(array $sessions, int $defaultMs = 100): int
@@ -223,14 +221,12 @@ function readUdpPacket($udp, array $sessions): array
 function acceptPeerSession(
     string $packet,
     string $peer,
-    string $host,
-    int $port,
+    Address $local,
     string $cert,
     string $key,
     string $alpn
 ): ?array {
-    $remote = parsePeerAddress($peer);
-    $local = new Address($host, $port);
+    $remote = Address::fromString($peer);
     $dgram = new Datagram($packet, $remote, $local);
 
     try {
@@ -258,16 +254,14 @@ function recvPeerDatagram(
     array &$session,
     string $packet,
     string $peer,
-    string $host,
-    int $port
+    Address $local
 ): void {
     $serverConn = $session['conn'] ?? null;
     if (!$serverConn instanceof ServerConnection) {
         return;
     }
 
-    $remote = parsePeerAddress($peer);
-    $local = new Address($host, $port);
+    $remote = Address::fromString($peer);
     $dgram = new Datagram($packet, $remote, $local);
 
     try {
@@ -281,8 +275,7 @@ function ingestIncomingPacket(
     array &$sessions,
     $packet,
     $from,
-    string $host,
-    int $port,
+    Address $local,
     string $cert,
     string $key,
     string $alpn
@@ -292,14 +285,14 @@ function ingestIncomingPacket(
     }
 
     if (!array_key_exists($from, $sessions)) {
-        $session = acceptPeerSession($packet, $from, $host, $port, $cert, $key, $alpn);
+        $session = acceptPeerSession($packet, $from, $local, $cert, $key, $alpn);
         if ($session !== null) {
             $sessions[$from] = $session;
         }
         return;
     }
 
-    recvPeerDatagram($sessions[$from], $packet, $from, $host, $port);
+    recvPeerDatagram($sessions[$from], $packet, $from, $local);
 }
 
 function handleSessionEvents(array &$session, string $peer, string $prefix): void
